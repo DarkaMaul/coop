@@ -70,11 +70,24 @@
 
             # The SSH and TLS unit tests bind loopback listeners.
             __darwinAllowLocalNetworking = true;
-            # APFS rejects the invalid UTF-8 name before this test can exercise
-            # coop's path validation. Keep the test enabled on Linux.
-            checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-              "--skip=commands::lifecycle::tests::check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir"
-            ];
+            checkFlags =
+              pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+                # APFS rejects the invalid UTF-8 name before this test can
+                # exercise coop's path validation. Keep it enabled on Linux.
+                "--skip=commands::lifecycle::tests::check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir"
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                # These tests remain enabled in ordinary Linux cargo test runs.
+                # The PID fixtures rename sleep's argv[0], which breaks nixpkgs'
+                # multicall coreutils. Their probes also require privileged sudo,
+                # which is unavailable in the Nix build sandbox.
+                "--skip=config::tests::is_firecracker_process_true_for_firecracker_named_pid"
+                "--skip=config::tests::is_running_true_for_live_firecracker_like_pid"
+
+                # Nix's Linux syscall filter rejects setxattr with ENOTSUP, so
+                # the default-ACL fixture fails even on ACL-capable filesystems.
+                "--skip=vm::tests::pid_trampoline_normalizes_inherited_default_acl"
+              ];
 
             # Nix owns upgrades of these immutable binaries. Keep the existing
             # dev-build guard against `coop update` and its background notifier.
