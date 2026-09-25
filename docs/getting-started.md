@@ -92,9 +92,11 @@ Nix profile:
 nix profile add .
 ```
 
-The [host prerequisites](#prerequisites) still apply: install the backend and
-host utilities separately and keep them on `PATH`. The flake builds the CLI
-and proxy; VM images are created by `coop setup`.
+On macOS, the package includes Lima and the host command-line tools used by
+coop, so `nix run . -- setup` does not require a separate Homebrew install.
+The Apple Silicon and Rosetta prerequisites above still apply. On Linux,
+install the [host prerequisites](#prerequisites) separately and keep them on
+`PATH`. VM images are created by `coop setup`.
 
 Nix packages identify as development builds, which disables `coop update`
 and background release notifications. To upgrade, update your checkout and

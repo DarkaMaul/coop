@@ -62,9 +62,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-Add Cargo's install directory (normally `~/.cargo/bin`) to `PATH` if needed
-to run the installed tools. The development shell does not install hooks
-or initialize a VM automatically.
+On macOS, the shell also provides Lima and the host tools included in the
+packaged CLI. Add Cargo's install directory (normally `~/.cargo/bin`) to
+`PATH` if needed to run the installed tools. The development shell does not
+install hooks or initialize a VM automatically.
 
 `nix build` packages both release binaries, and `nix flake check` builds the
 package and runs its workspace unit tests and installation checks for the

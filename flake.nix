@@ -36,6 +36,15 @@
             rustc = toolchain;
           };
           manifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+          darwinRuntimeInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.lima
+            pkgs.coreutils
+            pkgs.curl
+            pkgs.gitMinimal
+            pkgs.gnutar
+            pkgs.openssh
+            pkgs.rsync
+          ];
           coop = rustPlatform.buildRustPackage {
             pname = "coop";
             inherit (manifest.workspace.package) version;
@@ -44,9 +53,14 @@
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [ "--workspace" ];
             cargoTestFlags = [ "--workspace" ];
+            # Port-collision tests release their reservations before probing.
+            dontUseCargoParallelTests = true;
             strictDeps = true;
 
-            nativeBuildInputs = [ pkgs.cmake ];
+            nativeBuildInputs = [
+              pkgs.cmake
+              pkgs.makeBinaryWrapper
+            ];
             nativeCheckInputs = [
               pkgs.gitMinimal
               pkgs.openssh
@@ -66,11 +80,37 @@
             # dev-build guard against `coop update` and its background notifier.
             COOP_FORCE_BUILD_KIND = "dev";
 
+            # Keep the real executable in bin/ so its sibling lookup still
+            # finds coop-proxy after adding Lima and host tools to PATH.
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              wrapProgram "$out/bin/coop" \
+                --prefix PATH : ${pkgs.lib.makeBinPath darwinRuntimeInputs}
+            '';
+
             doInstallCheck = true;
             installCheckPhase = ''
               runHook preInstallCheck
               "$out/bin/coop" --version
               test -x "$out/bin/coop-proxy"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              runtimeCheckDir="$TMPDIR/coop-runtime-check"
+              mkdir -p "$runtimeCheckDir/state"
+              printf 'data_dir = "%s/state"\n' "$runtimeCheckDir" > "$runtimeCheckDir/config.toml"
+              # Stop at key generation, before any VM or image is created.
+              # The dangling link makes ssh-keygen fail when saving its key.
+              ln -s missing/key "$runtimeCheckDir/state/vm_key"
+              if env PATH= LIMA_HOME="$runtimeCheckDir/lima" \
+                "$out/bin/coop" --config "$runtimeCheckDir/config.toml" setup \
+                > "$runtimeCheckDir/setup.log" 2>&1; then
+                echo "setup unexpectedly passed the key-generation stop point" >&2
+                exit 1
+              fi
+              cat "$runtimeCheckDir/setup.log"
+              grep -F '  limactl: ' "$runtimeCheckDir/setup.log"
+              grep -F 'ssh-keygen failed' "$runtimeCheckDir/setup.log"
+            ''
+            + ''
               runHook postInstallCheck
             '';
 
@@ -92,7 +132,8 @@
               pkgs.gitMinimal
               pkgs.openssh
               pkgs.python3
-            ];
+            ]
+            ++ darwinRuntimeInputs;
           };
           formatter = pkgs.nixfmt;
         }
