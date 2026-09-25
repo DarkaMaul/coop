@@ -71,6 +71,36 @@ The binaries land at `target/release/coop` and `target/release/coop-proxy`.
 Keep them in the same directory when installing: proxy mode looks for its
 companion next to `coop`.
 
+### Nix
+
+The flake supports native builds on macOS arm64 and Linux x86_64/arm64.
+It pins its inputs in `flake.lock` and reads the Rust version from
+`rust-toolchain.toml`.
+
+From a checkout, with Nix flakes enabled:
+
+```sh
+nix build
+./result/bin/coop --version
+nix run . -- --help
+```
+
+`result/bin` contains both `coop` and `coop-proxy`. To install them in your
+Nix profile:
+
+```sh
+nix profile add .
+```
+
+The [host prerequisites](#prerequisites) still apply: install the backend and
+host utilities separately and keep them on `PATH`. The flake builds the CLI
+and proxy; VM images are created by `coop setup`.
+
+Nix packages identify as development builds, which disables `coop update`
+and background release notifications. To upgrade, update your checkout and
+run `nix profile upgrade coop` (or `nix build` for a local build).
+Use `nix flake update` when intentionally updating the pinned Nix inputs.
+
 ## Configuration
 
 coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
