@@ -524,7 +524,8 @@ passing none. The VM must be running.
 `coop agent update --codex` re-runs OpenAI's native installer as the guest
 user, including when migrating an older direct-binary installation. The full
 package stays in the user's home directory, with `/usr/local/bin/codex` linked
-to `~/.local/bin/codex`. The guest user can also run `codex update` directly
+to `~/.local/bin/codex` and `/usr/local/bin/codex-code-mode-host` linked to the
+same native release. The guest user can also run `codex update` directly
 without sudo.
 Claude Code and Grok Build already auto-update in the background;
 `coop agent update --claude` / `--grok` run `claude update` / `grok update`
