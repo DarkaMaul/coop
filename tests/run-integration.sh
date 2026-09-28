@@ -20,15 +20,22 @@ TEST_SCRIPT="$SCRIPT_DIR/integration.sh"
 
 REMOTE_HOST=""
 FULL="${TEST_FULL:-0}"
+REQUIRE_PROXY=0
 FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --remote)  REMOTE_HOST="$2";  shift 2 ;;
         --full)    FULL=1; FORWARD_ARGS+=("$1"); shift ;;
+        --require-proxy) REQUIRE_PROXY=1; shift ;;
         *)         FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
+
+if [[ "$REQUIRE_PROXY" == 1 && "$FULL" != 1 ]]; then
+    echo "--require-proxy requires --full" >&2
+    exit 1
+fi
 
 # ── Local mode ───────────────────────────────────────────────────
 
@@ -46,11 +53,15 @@ if [[ -z "$REMOTE_HOST" ]]; then
     # best-effort next to coop so the credential-proxy phase can run; if it
     # fails (e.g. cmake missing) that phase skips rather than blocking the suite.
     if ! cargo build --release -p coop-proxy --manifest-path "$PROJECT_DIR/Cargo.toml"; then
+        if [[ "$REQUIRE_PROXY" == 1 ]]; then
+            echo "ERROR: coop-proxy is required for this integration run" >&2
+            exit 1
+        fi
         echo "warning: coop-proxy build failed (cmake missing?) — proxy phase will skip" >&2
     fi
 
     BINARY="$PROJECT_DIR/target/release/coop"
-    exec "$TEST_SCRIPT" --binary "$BINARY" "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"
+    COOP_TEST_REQUIRE_PROXY="$REQUIRE_PROXY" exec "$TEST_SCRIPT" --binary "$BINARY" "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"
 fi
 
 # ── Remote mode ──────────────────────────────────────────────────
@@ -93,7 +104,7 @@ source_archive=""
 trap '[[ -z "$source_archive" ]] || rm -f "$source_archive"; ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
 
 echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
-scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$REMOTE_HOST:$REMOTE_DIR/"
+scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$PROJECT_DIR/src/seatbelt-proxy.sb" "$REMOTE_HOST:$REMOTE_DIR/"
 
 # The full network gate builds on the remote, as does the proxy fallback.
 # Include tracked working-tree edits so the gate tests the same code as coop.
@@ -133,7 +144,13 @@ else
         cd '$REMOTE_DIR/src'
         cargo build --release -p coop-proxy
         cp target/release/coop-proxy '$REMOTE_DIR/coop-proxy'
-    " || echo "warning: coop-proxy build on remote failed (needs cargo + cmake + cc) — proxy phase will skip" >&2
+    " || {
+        if [[ "$REQUIRE_PROXY" == 1 ]]; then
+            echo "ERROR: coop-proxy is required for this integration run" >&2
+            exit 1
+        fi
+        echo "warning: coop-proxy build on remote failed (needs cargo + cmake + cc) — proxy phase will skip" >&2
+    }
 fi
 
 # Build the remote command as an array, then printf %q to safely quote for ssh.
@@ -141,6 +158,9 @@ fi
 REMOTE_CMD=()
 if [[ "$FULL" == "1" ]]; then
     REMOTE_CMD+=("TEST_FULL=1")
+fi
+if [[ "$REQUIRE_PROXY" == 1 ]]; then
+    REMOTE_CMD+=("COOP_TEST_REQUIRE_PROXY=1")
 fi
 if [[ -n "${COOP_TEST_DESTRUCTIVE:-}" ]]; then
     REMOTE_CMD+=("COOP_TEST_DESTRUCTIVE=$COOP_TEST_DESTRUCTIVE")
