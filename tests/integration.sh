@@ -1342,7 +1342,7 @@ check_native_codex() {
     local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
     launcher="$guest_home/.local/bin/codex"
-    native_host="$guest_home/.local/bin/codex-code-mode-host"
+    native_host="$guest_home/.codex/packages/standalone/current/bin/codex-code-mode-host"
 
     if guest_exec test -x "$launcher" \
         && guest_exec test -L /usr/local/bin/codex \
@@ -1365,11 +1365,18 @@ check_native_codex() {
             "output: $version; stderr: $(guest_stderr)"
     fi
 
-    if coop_exec sh -c \
-        'timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio </dev/null >/dev/null'; then
-        pass "Codex Code Mode host accepts stdio transport"
+    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
+    # A successful hello must return connection/ready; an exit-zero stub cannot.
+    if coop_exec bash -o pipefail -c '
+        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
+        printf "\147\000\000\000%s" "$hello" |
+            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
+            dd bs=1 skip=4 status=none |
+            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
+    '; then
+        pass "Codex Code Mode host responds to stdio hello"
     else
-        fail "Codex Code Mode host accepts stdio transport" "stderr: $(guest_stderr)"
+        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
     fi
 
     codex_path=$(guest_exec readlink -f /usr/local/bin/codex)

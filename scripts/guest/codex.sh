@@ -13,7 +13,7 @@
 
     echo '  [guest] Installing Codex CLI and Code Mode host with the native installer...'
     CODEX_NATIVE_BIN="/home/${GUEST_USER}/.local/bin/codex"
-    CODEX_NATIVE_CODE_MODE_HOST="/home/${GUEST_USER}/.local/bin/codex-code-mode-host"
+    CODEX_NATIVE_CODE_MODE_HOST="/home/${GUEST_USER}/.codex/packages/standalone/current/bin/codex-code-mode-host"
     CODEX_INSTALLER=$(mktemp)
     CODEX_LINK_TMP="/usr/local/bin/codex.new.$$"
     CODEX_CODE_MODE_HOST_LINK_TMP="/usr/local/bin/codex-code-mode-host.new.$$"

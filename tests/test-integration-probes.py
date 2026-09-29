@@ -44,7 +44,7 @@ class ProbeTests(unittest.TestCase):
                     tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 native = root / "guest/.local/bin/codex"
-                native_host = root / "guest/.local/bin/codex-code-mode-host"
+                native_host = root / "guest/.codex/packages/standalone/current/bin/codex-code-mode-host"
                 system_bin = root / "bin"
                 system_bin.mkdir()
                 if cli_only_profile:

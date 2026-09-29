@@ -519,7 +519,7 @@ mod tests {
     fn codex_script_publishes_cli_and_code_mode_host() {
         for expected in [
             "CODEX_NATIVE_BIN=\"/home/${GUEST_USER}/.local/bin/codex\"",
-            "CODEX_NATIVE_CODE_MODE_HOST=\"/home/${GUEST_USER}/.local/bin/codex-code-mode-host\"",
+            "CODEX_NATIVE_CODE_MODE_HOST=\"/home/${GUEST_USER}/.codex/packages/standalone/current/bin/codex-code-mode-host\"",
             "mv -Tf \"$CODEX_CODE_MODE_HOST_LINK_TMP\" /usr/local/bin/codex-code-mode-host",
         ] {
             assert!(
