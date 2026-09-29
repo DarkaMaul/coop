@@ -105,6 +105,28 @@
               runHook preInstallCheck
               "$out/bin/coop" --version
               test -x "$out/bin/coop-proxy"
+
+              # Uninstall must refuse a store binary before purging any data,
+              # even with --yes/--purge and through the macOS wrapper.
+              uninstallCheckDir="$TMPDIR/coop-uninstall-check"
+              mkdir -p "$uninstallCheckDir/data"
+              printf 'data_dir = "%s/data"\n' "$uninstallCheckDir" > "$uninstallCheckDir/config.toml"
+              printf 'keep me\n' > "$uninstallCheckDir/data/sentinel"
+              for flags in "" "--yes" "--yes --purge" "--yes --keep-data"; do
+                if "$out/bin/coop" --config "$uninstallCheckDir/config.toml" uninstall $flags \
+                  < /dev/null > "$uninstallCheckDir/uninstall.log" 2>&1; then
+                  echo "uninstall unexpectedly accepted a Nix-store binary" >&2
+                  exit 1
+                fi
+                grep -F 'Cannot uninstall a Nix-managed binary' "$uninstallCheckDir/uninstall.log"
+                grep -F 'nix profile remove coop' "$uninstallCheckDir/uninstall.log"
+                if grep -F 'sudo coop uninstall' "$uninstallCheckDir/uninstall.log"; then
+                  echo "uninstall suggested sudo for a Nix-store binary" >&2
+                  exit 1
+                fi
+                test "$(cat "$uninstallCheckDir/data/sentinel")" = 'keep me'
+                test -x "$out/bin/coop"
+              done
             ''
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               runtimeCheckDir="$TMPDIR/coop-runtime-check"
