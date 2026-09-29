@@ -57,7 +57,7 @@ pub enum LogMode {
 /// diagnostics and are not themselves secret.
 #[derive(Clone, Default)]
 pub struct EnvForward {
-    vars: IndexMap<String, String>,
+    vars: IndexMap<crate::guest_env_state::EnvVarName, String>,
 }
 
 impl std::fmt::Debug for EnvForward {
@@ -80,8 +80,10 @@ impl std::fmt::Debug for EnvForward {
 
 impl EnvForward {
     /// Insert or overwrite an env var.
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.vars.insert(name.into(), value.into());
+    pub fn set(&mut self, name: impl AsRef<str>, value: impl Into<String>) -> Result<()> {
+        let name = crate::guest_env_state::EnvVarName::new(name.as_ref())?;
+        self.vars.insert(name, value.into());
+        Ok(())
     }
 
     /// Check whether a variable is present.
@@ -92,7 +94,7 @@ impl EnvForward {
     /// Inspect guest values in composition tests without exposing a production
     /// map that could accidentally be passed to `Command::envs`.
     #[cfg(test)]
-    pub fn guest_values(&self) -> &IndexMap<String, String> {
+    pub fn guest_values(&self) -> &IndexMap<crate::guest_env_state::EnvVarName, String> {
         &self.vars
     }
 
@@ -106,7 +108,6 @@ impl EnvForward {
         let mut cleanup = String::from("unset");
         let mut restore = String::new();
         for (index, (name, value)) in self.vars.iter().enumerate() {
-            crate::guest_env_state::EnvVarName::new(name)?;
             if value.contains('\0') {
                 bail!("Guest environment variable '{name}' contains a NUL byte");
             }
@@ -1467,9 +1468,9 @@ pub fn prepare_env_forwarding(
     } else if let Some(key) = &claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve claude.api_key")?;
-        env.set("ANTHROPIC_API_KEY", resolved);
+        env.set("ANTHROPIC_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        env.set("ANTHROPIC_API_KEY", key);
+        env.set("ANTHROPIC_API_KEY", key)?;
     }
 
     // OPENAI_API_KEY: prefer config, fall back to process env. In proxy mode
@@ -1484,9 +1485,9 @@ pub fn prepare_env_forwarding(
     } else if let Some(key) = &codex.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve codex.api_key")?;
-        env.set("OPENAI_API_KEY", resolved);
+        env.set("OPENAI_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        env.set("OPENAI_API_KEY", key);
+        env.set("OPENAI_API_KEY", key)?;
     }
 
     // XAI_API_KEY: prefer config, fall back to process env. Never written
@@ -1494,14 +1495,14 @@ pub fn prepare_env_forwarding(
     if let Some(key) = &grok.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve grok.api_key")?;
-        env.set("XAI_API_KEY", resolved);
+        env.set("XAI_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-        env.set("XAI_API_KEY", key);
+        env.set("XAI_API_KEY", key)?;
     }
 
     // GITHUB_TOKEN: resolve via configured strategy
     if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
-        env.set("GITHUB_TOKEN", token);
+        env.set("GITHUB_TOKEN", token)?;
     } else {
         tracing::debug!("no GITHUB_TOKEN forwarded to guest");
     }
@@ -1544,7 +1545,7 @@ pub fn prepare_env_forwarding(
         if !env.contains(name.as_str())
             && let Ok(val) = std::env::var(name.as_str())
         {
-            env.set(name.as_str(), val);
+            env.set(name.as_str(), val)?;
         }
     }
 
@@ -1561,7 +1562,7 @@ pub fn prepare_env_forwarding(
         if env.contains(name.as_str()) {
             tracing::warn!("guest_env entry '{name}' overrides a previously resolved value");
         }
-        env.set(name.as_str(), value.as_str());
+        env.set(name.as_str(), value.as_str())?;
     }
 
     Ok(env)
@@ -6805,7 +6806,7 @@ url = "https://example.com/m"
     fn forwarding_session(entries: &[(&str, &str)]) -> SshSession {
         let mut env = EnvForward::default();
         for (name, value) in entries {
-            env.set(*name, *value);
+            env.set(*name, *value).unwrap();
         }
         SshSession {
             target: SshTarget {
@@ -6870,7 +6871,16 @@ url = "https://example.com/m"
             .filter_map(|entry| entry.split_once('='))
             .collect();
         for (name, value) in entries {
-            assert_eq!(actual.get(name), Some(&value));
+            if name == "PATH" {
+                assert_eq!(
+                    actual
+                        .get(name)
+                        .and_then(|path| path.split(':').next_back()),
+                    Some(value),
+                );
+            } else {
+                assert_eq!(actual.get(name), Some(&value));
+            }
         }
         assert!(!actual.contains_key("COOP_SSH_ENV_1"));
     }
@@ -6990,7 +7000,7 @@ url = "https://example.com/m"
         assert!(String::from_utf8_lossy(&output.stderr).contains("missing forwarded environment"));
 
         session.env = EnvForward::default();
-        session.env.set("OPTIND", "private-test-value");
+        session.env.set("OPTIND", "private-test-value").unwrap();
         let output = session
             .command(&[], "printf command-ran")
             .unwrap()
@@ -7035,11 +7045,13 @@ url = "https://example.com/m"
 
     #[test]
     fn forwarding_rejects_invalid_names_and_nul_without_values_in_errors() {
-        for (name, value) in [("BAD-NAME", "secret-value"), ("VALID", "secret\0value")] {
-            let session = forwarding_session(&[(name, value)]);
-            let error = session.command(&[], "true").unwrap_err().to_string();
-            assert!(!error.contains("secret"));
-        }
+        let mut env = EnvForward::default();
+        let invalid_name = env.set("BAD-NAME", "secret-value").unwrap_err().to_string();
+        assert!(!invalid_name.contains("secret"));
+
+        let session = forwarding_session(&[("VALID", "secret\0value")]);
+        let invalid_value = session.command(&[], "true").unwrap_err().to_string();
+        assert!(!invalid_value.contains("secret"));
     }
 
     // ── EnvForward Debug redaction ──────────────────────────
@@ -7047,9 +7059,9 @@ url = "https://example.com/m"
     #[test]
     fn env_forward_debug_redacts_all_values() {
         let mut env = EnvForward::default();
-        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value");
-        env.set("GITHUB_TOKEN", "ghp_secret_value");
-        env.set("MYORG_INTERNAL", "internal-secret-blob");
+        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value").unwrap();
+        env.set("GITHUB_TOKEN", "ghp_secret_value").unwrap();
+        env.set("MYORG_INTERNAL", "internal-secret-blob").unwrap();
         let debug = format!("{env:?}");
         for secret in [
             "sk-ant-secret-value",

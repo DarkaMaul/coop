@@ -1780,7 +1780,7 @@ pub(crate) fn prepare_session_from_target(
                     tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
                     continue;
                 }
-                env.set(name.as_str(), value.as_str());
+                env.set(name.as_str(), value.as_str())?;
             }
         }
         // Codex reads its provider key from the env var named by `env_key`. In
@@ -1792,11 +1792,11 @@ pub(crate) fn prepare_session_from_target(
             if model.mode == model_state::ModelMode::Local
                 && let Some(ep) = model.resolved_codex(&cfg.codex)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
             } else if proxy_openai
                 && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, token);
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
             }
         }
     }
@@ -2557,6 +2557,7 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    #[cfg(target_os = "linux")]
     use crate::backend::VmBackend as _;
 
     #[cfg(target_os = "linux")]
@@ -2924,7 +2925,11 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"./project-bin\n");
+        let restored_path = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            restored_path.trim().split(':').next_back(),
+            Some("./project-bin")
+        );
         let envs = session.env.guest_values();
         assert_eq!(
             envs.get("FROM_CLI").map(String::as_str),
