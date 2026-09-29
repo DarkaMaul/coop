@@ -183,7 +183,7 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 9] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
