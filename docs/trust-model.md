@@ -42,6 +42,7 @@ user launched it.
 | Zone | Trust | Notes |
 |------|-------|-------|
 | Host user + `config.toml` | Trusted | `config.toml` `cmd:` values run arbitrary `sh -c` on the host (`config.rs:resolve_cmd_value`). The config file is a host code-execution surface; only the owner should write it. |
+| Project files (local or fetched) | **Untrusted** | Opting into project configuration authorizes guest configuration, not host code execution. |
 | coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs `iptables`/`firecracker` via `sudo`. |
 | The guest VM | **Untrusted** | Agent-controlled. Anything it emits — file contents, paths, archive members, command output — is a taint source once it crosses back to the host. |
 | GitHub API / model endpoints / DNS | External | `api.github.com` (PAT probe, release metadata), the model endpoint, `8.8.8.8`. Reached over the network; authenticated where applicable. |
@@ -69,14 +70,33 @@ user launched it.
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
   that way.
-- **A fetched `devcontainer.json`.** `git_repo_devcontainer.rs` /
-  `devcontainer.rs` parse devcontainer JSON that may originate from a remote
-  repo. Its values configure the guest; they must never reach a host `cmd:`
-  evaluation or host shell.
+- **Project configuration, local or fetched.** `git_repo_devcontainer.rs` /
+  `devcontainer.rs` parse repository-controlled devcontainer JSON. Its values
+  configure the guest; they must never select host executables, configure host
+  process environments, or reach host `cmd:` evaluation or a host shell.
+  Parsing, merging into `CoopConfig`, and saving/reloading instance state do
+  not make these values trusted. Choosing to use a project's devcontainer
+  configuration does not authorize that project to execute code on the host.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
 - **OCI feature blobs.** `devcontainer_oci.rs` pulls devcontainer *Features*
   from GHCR; the install snippet runs **in the guest**, not the host.
+
+## Host subprocess boundary
+
+For every tainted input that reaches a host subprocess, trace its origin through
+translation, merging, persistence, and reload to the actual launch. Include
+unchanged consumers when a change adds a less-trusted producer. Inspect the
+executable and its lookup path, arguments and option parsing, environment,
+working directory, and configuration files or wrappers the tool consumes.
+
+Argv APIs prevent shell interpolation; they do not prevent executable lookup
+through a tainted `PATH`, loader controls such as `LD_PRELOAD` or
+`DYLD_INSERT_LIBRARIES`, or tool-specific configuration from changing host
+behavior. An absolute executable path addresses lookup only. Guest-bound data
+must remain inert to the host transport and gain its intended meaning only in
+the guest; see the `EnvForward` invariant below. Review the complete launch
+context, including credentials inherited by a substituted process.
 
 ## Secrets and how they cross into the guest
 
@@ -427,8 +447,9 @@ Stop and get explicit human confirmation before merging a change that:
   name the boundary it crosses and what authenticates it;
 - forwards a new secret into the guest, or makes an existing one persistent
   inside the guest;
-- runs a host subprocess on tainted (guest- or fetch-derived) bytes — no shell
-  strings; use `Cmd::arg`/`RemoteCommand::arg`;
+- runs a host subprocess on tainted (guest-, project-, or fetch-derived)
+  bytes — inspect the full launch context above, including executable lookup,
+  environment, cwd, and tool configuration, as well as shell/argv handling;
 - writes a **host** filesystem path derived from tainted data — validate against
   traversal first;
 - logs or traces tainted or secret content — that channel becomes an
