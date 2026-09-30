@@ -53,6 +53,8 @@ user launched it.
   `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
+  Files retain their untrusted origin after transfer, including when a host tool
+  discovers them implicitly or consumes them during a later operation.
 - **Rootfs files touched while loop-mounted during setup.** `setup.rs`
   `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
   commit` turns a guest-mutated rootfs into an image template — so the guest
@@ -97,6 +99,14 @@ behavior. An absolute executable path addresses lookup only. Guest-bound data
 must remain inert to the host transport and gain its intended meaning only in
 the guest; see the `EnvForward` invariant below. Review the complete launch
 context, including credentials inherited by a substituted process.
+
+Transferred files also form part of a host tool's execution context. Trace
+implicitly discovered configuration and metadata through later coop commands
+and ordinary host-tool use, even when coop never parses the files itself. Path
+containment and successful transfer establish neither safe interpretation nor
+host execution authority. Record which consumer interprets each file and what
+authority that interpretation grants; explicit transfer opt-in does not by
+itself authorize host execution.
 
 ## Secrets and how they cross into the guest
 
