@@ -472,9 +472,14 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
+                    let mut results = Vec::new();
                     for index in 0..32 {
                         barrier.wait();
-                        private_dir(&root.path().join(format!("dir-{index}"))).unwrap();
+                        results.push(private_dir(&root.path().join(format!("dir-{index}"))));
+                    }
+                    // All callers reach every barrier even when creation fails.
+                    for result in results {
+                        result.unwrap();
                     }
                 });
             }
