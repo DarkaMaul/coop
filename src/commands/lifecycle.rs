@@ -1780,7 +1780,7 @@ pub(crate) fn prepare_session_from_target(
                     tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
                     continue;
                 }
-                env.set(name.as_str(), value.as_str());
+                env.set(name.as_str(), value.as_str())?;
             }
         }
         // Codex reads its provider key from the env var named by `env_key`. In
@@ -1792,11 +1792,11 @@ pub(crate) fn prepare_session_from_target(
             if model.mode == model_state::ModelMode::Local
                 && let Some(ep) = model.resolved_codex(&cfg.codex)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
             } else if proxy_openai
                 && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, token);
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
             }
         }
     }
@@ -2557,6 +2557,7 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    #[cfg(target_os = "linux")]
     use crate::backend::VmBackend as _;
 
     #[cfg(target_os = "linux")]
@@ -2873,7 +2874,22 @@ mod tests {
             super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
             "saved-value".to_string(),
         );
+        let project_config = tmp.path().join("devcontainer.json");
+        std::fs::write(
+            &project_config,
+            r#"{"containerEnv":{"PATH":"./project-bin"}}"#,
+        )
+        .unwrap();
+        let parsed = crate::devcontainer::ParsedDevcontainer::load(&project_config).unwrap();
+        let translated = crate::devcontainer::translate(
+            &parsed,
+            &crate::devcontainer::TranslatorInputs::default(),
+            crate::devcontainer::Stage::Start,
+        );
+        state.entries.extend(translated.guest_env);
         state.save(&inst).expect("save snapshot");
+        // A later shell loads only saved state, even if the project file is gone.
+        std::fs::remove_file(project_config).unwrap();
 
         let mut cfg = super::config::CoopConfig::default();
         // Sanity: an entry in cfg without a CLI override should still
@@ -2893,7 +2909,28 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let ssh = session
+            .command(&[], "/usr/bin/printenv PATH")
+            .expect("SSH command");
+        assert!(!ssh.get_envs().any(|(name, _)| name == "PATH"));
+        assert!(
+            ssh.get_envs()
+                .any(|(_, value)| value == Some(std::ffi::OsStr::new("./project-bin")))
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(ssh.get_args().last().unwrap())
+            .env_clear()
+            .envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let restored_path = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            restored_path.trim().split(':').next_back(),
+            Some("./project-bin")
+        );
+        let envs = session.env.guest_values();
         assert_eq!(
             envs.get("FROM_CLI").map(String::as_str),
             Some("saved-value"),
@@ -2949,7 +2986,7 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("ANTHROPIC_API_KEY"),
             "proxy mode re-injected the raw key from the persisted --env overlay",
@@ -2997,7 +3034,7 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("OPENAI_API_KEY"),
             "ChatGPT account auth re-injected the raw key from the persisted --env overlay",
@@ -3044,7 +3081,7 @@ mod tests {
             .expect("session must still be usable for non-Codex commands");
 
         assert!(
-            !session.env.as_envs().contains_key("OPENAI_API_KEY"),
+            !session.env.guest_values().contains_key("OPENAI_API_KEY"),
             "proxy mode must keep the raw key on the host",
         );
     }
@@ -3086,7 +3123,7 @@ mod tests {
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
             .expect("ChatGPT account auth must not break session preparation");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("OPENAI_API_KEY"),
             "ChatGPT account auth must not forward an OpenAI API key",
@@ -3264,7 +3301,7 @@ mod tests {
     /// reach `provision_first_boot` as `display()`'s U+FFFD substitution,
     /// naming a directory that does not exist — and fail there identically on
     /// every re-run, so the "re-run to finish" advice would never finish.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir() {
         use std::os::unix::ffi::OsStrExt as _;
