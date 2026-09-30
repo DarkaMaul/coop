@@ -1339,18 +1339,22 @@ test_claude_onboarding_seed() {
 }
 
 check_native_codex() {
-    local guest_home launcher version
+    local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
     launcher="$guest_home/.local/bin/codex"
+    native_host="$guest_home/.codex/packages/standalone/current/bin/codex-code-mode-host"
 
     if guest_exec test -x "$launcher" \
         && guest_exec test -L /usr/local/bin/codex \
         && guest_exec test /usr/local/bin/codex -ef "$launcher" \
+        && guest_exec test -x "$native_host" \
+        && guest_exec test -L /usr/local/bin/codex-code-mode-host \
+        && guest_exec test /usr/local/bin/codex-code-mode-host -ef "$native_host" \
         && [[ "$(guest_exec sh -c 'command -v codex')" == "$launcher" ]]; then
-        pass "Codex resolves through the guest's native launcher and compatibility link"
+        pass "Codex and its Code Mode host resolve through native-package compatibility links"
     else
-        fail "Codex resolves through the guest's native launcher and compatibility link" \
-            "expected launcher: $launcher; stderr: $(guest_stderr)"
+        fail "Codex and its Code Mode host resolve through native-package compatibility links" \
+            "expected launcher: $launcher; host: $native_host; stderr: $(guest_stderr)"
     fi
 
     if version=$(guest_exec /usr/local/bin/codex --version) \
@@ -1359,6 +1363,29 @@ check_native_codex() {
     else
         fail "Codex is executable through the compatibility link" \
             "output: $version; stderr: $(guest_stderr)"
+    fi
+
+    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
+    # A successful hello must return connection/ready; an exit-zero stub cannot.
+    if coop_exec bash -o pipefail -c '
+        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
+        printf "\147\000\000\000%s" "$hello" |
+            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
+            dd bs=1 skip=4 status=none |
+            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
+    '; then
+        pass "Codex Code Mode host responds to stdio hello"
+    else
+        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
+    fi
+
+    codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
+    host_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+    if [[ "$(dirname "$codex_path")" == "$(dirname "$host_path")" ]]; then
+        pass "Codex and its Code Mode host come from the same native release"
+    else
+        fail "Codex and its Code Mode host come from the same native release" \
+            "codex=$codex_path host=$host_path"
     fi
 }
 
@@ -4591,6 +4618,8 @@ post_install = '''
 echo 'custom-profile-marker' > /etc/custom-profile-installed
 printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
 chmod 0755 /usr/local/bin/codex
+printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/codex-code-mode-host
+chmod 0755 /usr/local/bin/codex-code-mode-host
 '''
 CFGEOF
 
@@ -4624,9 +4653,9 @@ CFGEOF
     local marker
     marker=$(guest_exec cat /etc/custom-profile-installed) || marker=""
     if [[ "$(guest_exec /usr/local/bin/codex --version)" == "codex-cli 9.9.9-profile" ]]; then
-        pass "custom profile's Codex is not replaced by the native installer"
+        pass "custom profile's complete Codex pair is not replaced by the native installer"
     else
-        fail "custom profile's Codex is not replaced by the native installer" \
+        fail "custom profile's complete Codex pair is not replaced by the native installer" \
             "stderr: $(guest_stderr)"
     fi
 
