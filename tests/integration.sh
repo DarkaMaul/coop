@@ -6098,8 +6098,8 @@ test_proxy() {
     fi
     # The proxy needs the `coop-proxy` binary next to `coop`. It is not a
     # default workspace member (it needs cmake for aws-lc-rs), so a plain
-    # `cargo build` / older deploy may not have it; skip rather than fail the
-    # fail-closed `up` when it's absent.
+    # `cargo build` / older deploy may not have it. Developer runs may skip;
+    # required release runs fail before attempting `up`.
     if [[ ! -x "$(dirname "$BINARY")/coop-proxy" ]]; then
         if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
             fail "credential-proxy prerequisites" "coop-proxy not built alongside coop"

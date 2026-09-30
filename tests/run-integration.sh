@@ -12,7 +12,8 @@ set -euo pipefail
 # the matching musl binary, copies it and the test script, and runs tests there.
 #
 # --full also runs integration-network.sh on the test host before the VM suite.
-# All flags other than --remote are forwarded to integration.sh.
+# --require-proxy requires full mode and fails if proxy prerequisites or the
+# proxy phase are missing. Other flags besides --remote reach integration.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -50,8 +51,7 @@ if [[ -z "$REMOTE_HOST" ]]; then
 
     # coop-proxy (issue #411) is a separate workspace member — it needs cmake
     # (aws-lc-rs), so it is intentionally not a default member. Build it
-    # best-effort next to coop so the credential-proxy phase can run; if it
-    # fails (e.g. cmake missing) that phase skips rather than blocking the suite.
+    # best-effort for developer runs; release runs require it to build.
     if ! cargo build --release -p coop-proxy --manifest-path "$PROJECT_DIR/Cargo.toml"; then
         if [[ "$REQUIRE_PROXY" == 1 ]]; then
             echo "ERROR: coop-proxy is required for this integration run" >&2
@@ -88,8 +88,8 @@ LOCAL_PROXY="$PROJECT_DIR/target/$TARGET/release/coop-proxy"
 # cross-arch build to a foreign libc is fragile. Try a local cross-build first
 # (works when the host and remote share an arch); otherwise build it natively
 # ON the remote, which by definition supports its own arch. Either way the
-# binary lands next to coop so `coop` can spawn it. If neither path yields one,
-# the proxy phase skips rather than failing the fail-closed `up`.
+# binary lands next to coop so `coop` can spawn it. Developer runs may skip
+# the proxy phase if neither build succeeds; required mode fails instead.
 build_proxy_on_remote=1
 if cargo build --release --target "$TARGET" -p coop-proxy \
     --manifest-path "$PROJECT_DIR/Cargo.toml" && [[ -f "$LOCAL_PROXY" ]]; then
@@ -135,7 +135,7 @@ fi
 if [[ "$build_proxy_on_remote" == "0" ]]; then
     scp -q "$LOCAL_PROXY" "$REMOTE_HOST:$REMOTE_DIR/"
 else
-    # Best-effort: the proxy fallback requires cargo + cmake + a C compiler.
+    # The proxy fallback requires cargo + cmake + a C compiler.
     echo "Building coop-proxy natively on $REMOTE_HOST..."
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path; expand client-side
     ssh "$REMOTE_HOST" "
