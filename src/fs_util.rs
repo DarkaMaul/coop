@@ -14,6 +14,21 @@ use anyhow::{Context, Result, bail};
 /// must have the sticky bit (for example /tmp). Existing private directories
 /// are tightened through their open descriptor before being used.
 pub fn private_dir(path: &Path) -> Result<()> {
+    seal_private_dir(path, MissingDirectory::Create)
+}
+
+/// Seal existing private storage without recreating a concurrently removed path.
+pub fn private_existing_dir(path: &Path) -> Result<()> {
+    seal_private_dir(path, MissingDirectory::Reject)
+}
+
+#[derive(Clone, Copy)]
+enum MissingDirectory {
+    Create,
+    Reject,
+}
+
+fn seal_private_dir(path: &Path, missing: MissingDirectory) -> Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Component;
@@ -47,7 +62,10 @@ pub fn private_dir(path: &Path) -> Result<()> {
         }
         let (next, creation) = match opened {
             Ok(next) => (next, DirectoryCreation::Existing),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && matches!(missing, MissingDirectory::Create) =>
+            {
                 let creation = create_private_directory_at(&directory, &name)?;
                 (
                     open_directory_at(&directory, &name, SymlinkPolicy::Reject)?,
@@ -460,6 +478,27 @@ mod tests {
                 Some(errno)
             );
         }
+    }
+
+    #[test]
+    fn existing_directory_repair_preserves_absence() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = root.path().join("missing/child");
+        let error = private_existing_dir(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!root.path().join("missing").exists());
+        private_dir(&path).unwrap();
+        private_existing_dir(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

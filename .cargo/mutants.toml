@@ -157,6 +157,8 @@ exclude_re = [
   # private_storage.rs — root-owned disk repair invokes sudo; host integration
   # covers that branch. The user-owned mode and ACL paths have unit regressions.
   "src/private_storage\\.rs:.*\\bprivate_file\\b",
+  # Migration diagnostics write tracing output; the missing-error decision stays tested.
+  "\\breport_migration_result\\b",
 
   # Darwin ACL functions are compiled out on the Linux mutation host; native
   # macOS unit tests exercise allow/deny ACLs and ACL removal.

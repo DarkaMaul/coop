@@ -82,6 +82,8 @@ pub fn create_and_start(
     mounts: &[crate::config::Mount],
 ) -> Result<()> {
     let name = lima_name(inst);
+    seal_instance_storage(&lima_home()?.join(&name))?;
+    crate::private_storage::prepare_directory(&cfg.image_dir(&inst.image))?;
     let template_path = cfg.lima_template_path(&inst.image);
     let base_img = cfg.lima_base_path(&inst.image);
 
@@ -522,6 +524,7 @@ pub fn restore_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Res
 pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
     let name = lima_name(inst);
     let dir = lima_home()?.join(name);
+    seal_instance_storage(&dir)?;
     disk_path_at(&dir)
 }
 
@@ -676,6 +679,7 @@ pub fn stream_logs(inst: &Instance, mode: LogMode) -> Result<()> {
 
     // Lima logs are in ~/.lima/<name>/serial.log
     let lima_dir = lima_home()?.join(&name);
+    seal_instance_storage(&lima_dir)?;
     let serial_log = lima_dir.join("serial.log");
     let ha_log = lima_dir.join("ha.stderr.log");
 
@@ -1960,7 +1964,10 @@ pub(crate) fn prepare_private_storage() -> Result<()> {
         if !entry.file_name().to_string_lossy().starts_with(LIMA_PREFIX) {
             continue;
         }
-        seal_instance_storage(&entry.path())?;
+        crate::private_storage::report_migration_result(
+            &entry.path(),
+            &seal_instance_storage(&entry.path()),
+        );
     }
     Ok(())
 }
@@ -1969,7 +1976,7 @@ fn seal_instance_storage(directory: &Path) -> Result<()> {
     match directory.symlink_metadata() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
-        Ok(_) => crate::fs_util::private_dir(directory)?,
+        Ok(_) => crate::fs_util::private_existing_dir(directory)?,
     }
     for path in [
         disk_path_at(directory)?,
@@ -2019,6 +2026,7 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
 }
 
 fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Value>> {
+    seal_instance_storage(&lima_home()?.join(lima_name))?;
     let stdout = limactl_list_output()?;
     // limactl list --json outputs one JSON object per line (NDJSON)
     for line in stdout.lines() {

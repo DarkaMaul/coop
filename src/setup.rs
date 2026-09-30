@@ -76,6 +76,7 @@ pub struct TemplateConfig {
 
 impl TemplateConfig {
     pub fn load_for(cfg: &CoopConfig, image: &ImageName) -> Result<Self> {
+        crate::private_storage::prepare_directory(&cfg.image_dir(image))?;
         let path = cfg.template_config_path_for(image);
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;

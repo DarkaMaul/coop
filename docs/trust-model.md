@@ -138,8 +138,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - **Private host storage is enforced.** Managed data/image/instance/state
   directories use `0700`; persisted environment overrides, JSON state, tokens,
   SSH private keys, and VM disks use `0600`. Atomic temporary files are private
-  before content is written. Existing managed state is repaired before use,
-  without entering mounted guest filesystems. Directory traversal rejects
+  before content is written. Shared roots are sealed before migration; unsafe
+  instance/image entries are reported independently, and removed entries are
+  ignored. Shared credential storage remains strict. Selected instance and image state is strictly repaired before use without
+  entering mounted guest filesystems. Directory traversal rejects
   symlinks except root-owned OS ancestor aliases, foreign ownership, and
   non-sticky writable ancestors; sensitive files reject symlinks and hardlinks.
   Lima’s same-directory `disk` → `diffdisk` alias is permitted. macOS ancestor

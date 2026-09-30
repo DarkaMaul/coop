@@ -27,8 +27,11 @@ private temporary files before writing their contents. Lima runs with a `077`
 child umask, reapplies disk modes after startup, and protects its coop instance directories under `LIMA_HOME` (or
 `~/.lima`).
 
-Commands that use managed storage repair existing permissions before reading
-state, without walking mounted guest filesystems or workspaces. Repairing a
+Commands seal shared storage roots and migrate existing entries without walking
+mounted guest filesystems or workspaces. Entries removed during migration are
+ignored; unsafe instance or image entries are reported without blocking unrelated
+commands. Loading a selected instance or image strictly checks its directory and
+managed files. Shared credential storage and the common SSH key remain strict. Repairing a
 root-owned Firecracker disk may request sudo. Private storage must be owned by
 the invoking user; Firecracker disks may also be root-owned. Symlinked managed
 paths, hardlinked sensitive files, and ancestors owned by another user are

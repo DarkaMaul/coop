@@ -193,7 +193,8 @@ both assertions work. Apply the execution restrictions above.
 ## Private storage checks
 
 Unit tests cover private creation under permissive and restrictive umasks, atomic replacement,
-legacy state repair, unsafe links and parents, and Linux POSIX ACL removal.
+legacy state repair, concurrent instance removal, unsafe links and parents,
+Firecracker config creation/replacement, and Linux POSIX ACL removal.
 The umask fixtures run in child processes to avoid changing other tests' umask. Two Linux host probes require passwordless sudo:
 
 ```bash

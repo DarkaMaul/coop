@@ -2224,6 +2224,13 @@ impl CoopConfig {
                     continue;
                 }
             };
+            if let Err(error) = crate::private_storage::prepare_directory(&entry.path()) {
+                tracing::warn!(
+                    "Skipping image directory {}: {error:#}",
+                    entry.path().display()
+                );
+                continue;
+            }
             let config_path = self.template_config_path_for(&name);
             let config = if config_path.exists() {
                 let content = fs::read_to_string(&config_path).ok();
@@ -2661,6 +2668,7 @@ impl Instance {
     }
 
     fn load(dir: &Path) -> Result<Self> {
+        crate::private_storage::prepare_directory(dir)?;
         let meta_path = dir.join("instance.json");
         let content = fs::read_to_string(&meta_path)
             .with_context(|| format!("Failed to read {}", meta_path.display()))?;

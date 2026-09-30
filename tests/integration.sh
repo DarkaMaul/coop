@@ -549,11 +549,16 @@ for directory in (root, root / "images", root / "instances", root / "state", ins
 state = instance / "instance.json"
 assert state.is_file(), state
 assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+for state in instance.glob("*.json"):
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
 if sys.platform == "darwin":
     directory = pathlib.Path(os.environ.get("LIMA_HOME", str(pathlib.Path.home() / ".lima"))) / ("coop-" + sys.argv[1])
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
     disk = next((directory / name for name in ("disk", "diffdisk") if (directory / name).exists()), None)
 else:
+    config = instance / "vm_config.json"
+    assert config.is_file(), config
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600, config
     disk = instance / "rootfs.ext4"
 assert disk is not None and disk.is_file(), disk
 assert stat.S_IMODE(disk.stat().st_mode) == 0o600, disk
