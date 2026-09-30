@@ -163,6 +163,14 @@ from cargo-mutants. Run such checks only in an authorized test environment;
 read-only CI review must report them as unrun when contributor execution is
 forbidden. The concrete forwarding checks above implement this pattern for SSH.
 
+For file-transfer changes, extend the fixture through the later host operation
+that consumes the transferred data. Use the relevant real tool to exercise
+implicit file discovery, with a disposable destination and no real credentials
+or user configuration. Pair an assertion on unintended host effects with a
+positive witness that the intended transfer or rejection and consumer check
+occurred. Separately break the boundary guard and the intended outcome to prove
+both assertions work. Apply the execution restrictions above.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

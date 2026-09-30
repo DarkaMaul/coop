@@ -33,10 +33,13 @@ Gather once and share with every reviewer:
 
 - PR description and linked issue, commit list, changed paths, and diff.
 - Post-change bodies of touched functions. A hunk alone is not enough.
-- For new or changed external configuration inputs, a source-to-sink trace:
+- For new or changed external configuration inputs or file-transfer behavior,
+  a source-to-sink trace:
   origin/trust, translation and merging, persistence/reload, and every reachable
   host subprocess consumer, including unchanged functions. Add those consumers
   and their guards to the packet; touched symbols do not bound this inspection.
+  Include files discovered implicitly by host tools and consumption in later
+  commands, including ordinary host tools used outside coop.
 - Root `AGENTS.md` and relevant system-of-record docs: `ARCHITECTURE.md`,
   `trust-model.md`, `code-style.md`, `testing.md`, `.cargo/mutants.toml`,
   command/config references, and nearby platform notes.
@@ -76,8 +79,9 @@ Run when triggered:
 - **Security:** first read `docs/trust-model.md`; inspect tainted subprocess
   input, secret storage/logging, host paths, listeners/egress, SSH, and the
   updater trust chain. Changes to project configuration, env composition,
-  persistence/reload, or host launch context always trigger this lens, even
-  when subprocess code is unchanged. Call out every stop-and-confirm trigger.
+  persistence/reload, host launch context, or file-transfer defaults, exclusions,
+  extraction, and mirroring always trigger this lens, even when subprocess code
+  is unchanged. Call out every stop-and-confirm trigger.
 - **API usage:** verify against the version pinned in `Cargo.lock` or the exact
   installed binary. Check signatures, flags, error behavior, enabled features,
   and deprecations using primary documentation.
@@ -134,7 +138,9 @@ apply across all lenses:
 
 ### Trace authority across boundaries
 
-- Follow untrusted configuration to its consumers, rather than stopping at a
+- Follow untrusted configuration and transferred files to their consumers,
+  including later operations and files discovered implicitly by host tools.
+  Preserve their origin across disk writes and subsequent reads. Do not stop at a
   parser, valid newtype, merged config, or saved state. Record what each guard
   proves and which execution domain may interpret the value. Syntax validation
   and user opt-in do not grant project data host execution authority.
