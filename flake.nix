@@ -62,9 +62,38 @@
               pkgs.makeBinaryWrapper
             ];
             nativeCheckInputs = [
+              pkgs.bash
+              pkgs.coreutils
               pkgs.gitMinimal
+              pkgs.gnused
               pkgs.openssh
             ];
+            # Guest simulations need store tools and a usable login shell.
+            # Use Bash's readonly BASHOPTS for the rejected-assignment fixture;
+            # newer Dash accepts the nonnumeric OPTIND rejected by guest Dash.
+            postPatch = ''
+              substituteInPlace src/backend.rs \
+                --replace-fail 'let mut guest = Command::new("/bin/sh");' \
+                  'let mut guest = Command::new("${pkgs.bash}/bin/bash");' \
+                --replace-fail 'guest.env_clear();' \
+                  'guest.env_clear().env("SHELL", "${pkgs.bash}/bin/bash");' \
+                --replace-fail 'guest.arg("-c").arg(ssh.get_args().last().unwrap());' \
+                  'guest.arg("-c").arg(ssh.get_args().last().unwrap().to_string_lossy().replacen("/bin/sh -c", "${pkgs.bash}/bin/bash -c", 1));' \
+                --replace-fail '"/usr/bin/env -0"' '"${pkgs.coreutils}/bin/env -0"' \
+                --replace-fail '.env("SHELL", "/bin/bash")' '.env("SHELL", "${pkgs.bash}/bin/bash")' \
+                --replace-fail '"/bin/cat; exit 37"' '"${pkgs.coreutils}/bin/cat; exit 37"' \
+                --replace-fail 'OPTIND' 'BASHOPTS' \
+                --replace-fail "The guest's dash shell treats BASHOPTS as numeric." \
+                  "The fixture's Bash shell treats BASHOPTS as readonly."
+              substituteInPlace src/commands/lifecycle.rs \
+                --replace-fail '"/usr/bin/printenv PATH"' '"${pkgs.coreutils}/bin/printenv PATH"' \
+                --replace-fail '.envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))' \
+                  '.env("SHELL", "${pkgs.bash}/bin/bash").envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))'
+              substituteInPlace src/ssh.rs \
+                --replace-fail '/usr/bin/sed' '${pkgs.gnused}/bin/sed' \
+                --replace-fail 'SHELL=/bin/bash /bin/sh -c' \
+                  'SHELL=${pkgs.bash}/bin/bash ${pkgs.bash}/bin/bash -c'
+            '';
             # CMake builds aws-lc-sys through Cargo, not the top-level project.
             dontUseCmakeConfigure = true;
 
