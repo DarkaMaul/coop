@@ -26,6 +26,7 @@ mod naming;
 mod pat_prompt;
 mod paths;
 mod port_forward;
+mod private_storage;
 mod proxy;
 mod proxy_state;
 mod remote_command;
@@ -65,7 +66,7 @@ mod workspace;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCandidates;
 
@@ -1095,6 +1096,7 @@ pub fn run() -> Result<()> {
     }
 
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
     cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);

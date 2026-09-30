@@ -11,9 +11,7 @@
 //! available so the wizard always has at least one storage choice.
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -568,23 +566,14 @@ fn store_file(
     state_dir: &Path,
 ) -> Result<CmdToken> {
     let dir = state_dir.join(secret_subdir(service));
-    fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    set_dir_mode(&dir, 0o700)?;
+    crate::fs_util::private_dir(&dir)?;
     let path = file_backend_path(&dir, account);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("Failed to create {}", path.display()))?;
-    f.write_all(token.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    // Newline-terminate so `cat` output is friendly.
-    if !token.ends_with('\n') {
-        f.write_all(b"\n")
-            .with_context(|| format!("Failed to write {}", path.display()))?;
-    }
+    let content = if token.ends_with('\n') {
+        token.to_string()
+    } else {
+        format!("{token}\n")
+    };
+    crate::fs_util::atomic_write_with_mode(&path, &content, 0o600)?;
     Ok(CmdToken::File {
         dir,
         account: account.clone(),
@@ -604,12 +593,6 @@ fn secret_subdir(service: &str) -> &str {
 /// per-service directory from [`secret_subdir`].
 fn file_backend_path(dir: &Path, account: &AccountName) -> PathBuf {
     dir.join(format!("{account}.txt"))
-}
-
-fn set_dir_mode(path: &Path, mode: u32) -> Result<()> {
-    let perms = std::fs::Permissions::from_mode(mode);
-    fs::set_permissions(path, perms)
-        .with_context(|| format!("Failed to chmod {} to {mode:#o}", path.display()))
 }
 
 /// POSIX shell-quote `s` for safe embedding in a `cmd:` invocation.
@@ -648,6 +631,7 @@ pub const OPENAI_SERVICE: &str = "coop-openai";
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn file_backend_always_available() {

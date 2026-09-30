@@ -190,6 +190,20 @@ positive witness that the intended transfer or rejection and consumer check
 occurred. Separately break the boundary guard and the intended outcome to prove
 both assertions work. Apply the execution restrictions above.
 
+## Private storage checks
+
+Unit tests cover private creation under permissive and restrictive umasks, atomic replacement,
+legacy state repair, unsafe links and parents, and Linux POSIX ACL removal.
+The umask fixtures run in child processes to avoid changing other tests' umask. Two Linux host probes require passwordless sudo:
+
+```bash
+cargo test --lib private_disk_reflink_copy_and_root_owned_migration -- --ignored
+cargo test --lib rejects_files_and_directories_owned_by_another_user -- --ignored
+```
+
+The VM integration suite checks host directory, JSON state, template disk, and
+instance disk modes after creation and after commit/restore on both backends.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

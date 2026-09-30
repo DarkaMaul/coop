@@ -32,7 +32,7 @@ pub const HOST_GATEWAY: &str = "host.lima.internal";
 
 /// Run first-time setup for Lima backend.
 pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-    fs::create_dir_all(&cfg.data_dir).context("Failed to create data directory")?;
+    crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
     check_requirements()?;
     ensure_ssh_key(cfg)?;
@@ -120,7 +120,7 @@ pub fn create_and_start(
             "Lima instance '{name}' already exists (status: {state}) — \
              cleaning up before re-creating"
         );
-        let deletion = Command::new("limactl")
+        let deletion = private_limactl()
             .args(["delete", "--force", &name])
             .status()
             .context("Failed to delete stale Lima instance")?;
@@ -139,7 +139,7 @@ pub fn create_and_start(
         base_image_size_gib(&base_img).unwrap_or(cfg.vm.template_size_gib)
     });
     let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
-    let mut child = Command::new("limactl")
+    let mut child = private_limactl()
         .arg("start")
         .arg(&effective_template)
         .arg(format!("--name={name}"))
@@ -165,6 +165,7 @@ pub fn create_and_start(
             Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
             Err(_) => String::new(),
         };
+        seal_instance_storage(&lima_home()?.join(&name))?;
         let detail = extract_lima_error(&lima_stderr);
         bail!(
             "Failed to start instance '{name}': {e}\n\
@@ -175,7 +176,9 @@ pub fn create_and_start(
         );
     }
 
+    let permissions = seal_instance_storage(&lima_home()?.join(&name));
     reap_in_background(child);
+    permissions?;
     tracing::info!("Lima instance '{name}' started");
     Ok(())
 }
@@ -192,7 +195,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
-    let mut child = Command::new("limactl")
+    let mut child = private_limactl()
         .args(["start", &name])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -212,6 +215,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
             Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
             Err(_) => String::new(),
         };
+        seal_instance_storage(&lima_home()?.join(&name))?;
         let detail = extract_lima_error(&lima_stderr);
         bail!(
             "Failed to restart instance '{}': {e}\n\
@@ -222,7 +226,9 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         );
     }
 
+    let permissions = seal_instance_storage(&lima_home()?.join(&name));
     reap_in_background(child);
+    permissions?;
     tracing::info!("Lima instance '{name}' restarted");
     Ok(())
 }
@@ -236,7 +242,7 @@ pub fn stop_running(inst: &Instance) -> Result<()> {
 
     tracing::info!("Stopping Lima instance '{name}'");
 
-    let status = Command::new("limactl")
+    let status = private_limactl()
         .args(["stop", &name])
         .status()
         .context("Failed to run limactl stop")?;
@@ -263,7 +269,7 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
     // Stop first if running
     if state == Some(LimaState::Running)
-        && let Err(e) = Command::new("limactl").args(["stop", &name]).status()
+        && let Err(e) = private_limactl().args(["stop", &name]).status()
     {
         tracing::debug!("Failed to stop Lima instance '{name}' before delete (non-fatal): {e}");
     }
@@ -272,7 +278,7 @@ pub fn destroy(inst: &Instance) -> Result<()> {
         bail!("Lima instance '{name}' has unknown state '{status}' — refusing delete");
     }
 
-    let status = Command::new("limactl")
+    let status = private_limactl()
         .args(["delete", "--force", &name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -471,14 +477,16 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
     }
 
     let image_dir = cfg.image_dir(image);
-    fs::create_dir_all(&image_dir)
+    crate::fs_util::private_dir(&image_dir)
         .with_context(|| format!("Failed to create image dir {}", image_dir.display()))?;
 
     let base_img = cfg.lima_base_path(image);
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
+    crate::private_storage::private_file(&src)?;
     fs::copy(&src, &base_img)
         .with_context(|| format!("Failed to copy {} -> {}", src.display(), base_img.display()))?;
 
+    crate::private_storage::private_file(&base_img)?;
     generate_start_template(cfg, image)
 }
 
@@ -500,8 +508,10 @@ pub fn restore_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Res
     }
 
     tracing::info!("Restoring instance '{}' from image '{image}'", inst.name);
+    crate::private_storage::private_file(&base_img)?;
     fs::copy(&base_img, &dst)
         .with_context(|| format!("Failed to copy {} -> {}", base_img.display(), dst.display()))?;
+    crate::private_storage::private_file(&dst)?;
     Ok(())
 }
 
@@ -512,11 +522,23 @@ pub fn restore_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Res
 pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
     let name = lima_name(inst);
     let dir = lima_home()?.join(name);
+    disk_path_at(&dir)
+}
+
+fn disk_path_at(dir: &Path) -> Result<PathBuf> {
     let new_path = dir.join("disk");
-    if new_path.exists() {
-        return Ok(new_path);
+    match new_path.symlink_metadata() {
+        Ok(metadata) if metadata.is_symlink() => {
+            let target = fs::read_link(&new_path)?;
+            if target != Path::new("diffdisk") && target != dir.join("diffdisk") {
+                bail!("Unexpected Lima disk alias: {}", new_path.display());
+            }
+            Ok(dir.join("diffdisk"))
+        }
+        Ok(_) => Ok(new_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(dir.join("diffdisk")),
+        Err(error) => Err(error.into()),
     }
-    Ok(dir.join("diffdisk"))
 }
 
 /// The lifecycle state Lima reports for an instance.
@@ -716,7 +738,7 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
 fn check_requirements() -> Result<()> {
     eprintln!("\n=> Checking Lima requirements");
 
-    let output = Command::new("limactl").arg("--version").output();
+    let output = private_limactl().arg("--version").output();
 
     match output {
         Ok(o) if o.status.success() => {
@@ -832,7 +854,7 @@ fn build_golden_image(
         .with_context(|| format!("Failed to read SSH public key at {}", pubkey_path.display()))?;
 
     // Clean up any leftover builder instance from a previous failed build
-    if let Err(e) = Command::new("limactl")
+    if let Err(e) = private_limactl()
         .args(["delete", "--force", BUILDER_NAME])
         .output()
     {
@@ -884,7 +906,7 @@ fn build_golden_image(
 
     // Always clean up builder resources
     eprintln!("  Cleaning up builder VM...");
-    if let Err(e) = Command::new("limactl")
+    if let Err(e) = private_limactl()
         .args(["delete", "--force", BUILDER_NAME])
         .status()
     {
@@ -953,7 +975,7 @@ fn run_builder_vm(
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
-    let mut command = Command::new("limactl");
+    let mut command = private_limactl();
     command.arg("start");
     if let Some(timeout) = builder_timeout {
         command
@@ -967,6 +989,7 @@ fn run_builder_vm(
         .status()
         .context("Failed to run limactl start for builder")?;
 
+    seal_instance_storage(&lima_home()?.join(BUILDER_NAME))?;
     if !status.success() {
         dump_builder_logs();
         bail!("Failed to build golden image — limactl start failed.");
@@ -989,7 +1012,7 @@ fn run_builder_vm(
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
-    let ci_status = Command::new("limactl")
+    let ci_status = private_limactl()
         .args([
             "shell",
             BUILDER_NAME,
@@ -1011,7 +1034,7 @@ fn run_builder_vm(
 
     // Stop the builder VM
     eprintln!("  Stopping builder VM...");
-    let status = Command::new("limactl")
+    let status = private_limactl()
         .args(["stop", BUILDER_NAME])
         .status()
         .context("Failed to stop builder VM")?;
@@ -1024,26 +1047,18 @@ fn run_builder_vm(
     // Lima v2.1.0 renamed "diffdisk" to "disk"; try new name first.
     eprintln!("  Extracting disk image...");
     let lima_dir = lima_home()?.join(BUILDER_NAME);
-    let src_disk = lima_dir.join("disk");
-    let src_disk = if src_disk.exists() {
-        src_disk
-    } else {
-        let legacy = lima_dir.join("diffdisk");
-        if !legacy.exists() {
-            bail!(
-                "Builder disk not found at {} or {}.\n\
-                 Lima may use a different disk layout.",
-                lima_dir.join("disk").display(),
-                legacy.display(),
-            );
-        }
-        legacy
-    };
-
+    let src_disk = disk_path_at(&lima_dir)?;
+    if !src_disk.exists() {
+        bail!(
+            "Builder disk not found at {}. Lima may use a different disk layout.",
+            src_disk.display()
+        );
+    }
     if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
+        crate::fs_util::private_dir(parent)
             .with_context(|| format!("Failed to create dir {}", parent.display()))?;
     }
+    crate::private_storage::private_file(&src_disk)?;
     fs::copy(&src_disk, output_path).with_context(|| {
         format!(
             "Failed to copy disk from {} to {}",
@@ -1052,6 +1067,7 @@ fn run_builder_vm(
         )
     })?;
 
+    crate::private_storage::private_file(output_path)?;
     Ok(baked)
 }
 
@@ -1189,7 +1205,7 @@ fn dump_builder_logs() {
     }
 
     // 2. Guest-side: try to grab cloud-init-output.log via SSH
-    if let Ok(output) = Command::new("limactl")
+    if let Ok(output) = private_limactl()
         .args([
             "shell",
             BUILDER_NAME,
@@ -1236,7 +1252,7 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
         "--wait".to_string(),
     ]);
 
-    let output = Command::new("limactl")
+    let output = private_limactl()
         .args(args)
         .output()
         .context("Failed to check cloud-init status in builder VM")?;
@@ -1259,7 +1275,7 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
     if let Err(e) = cloud_init_result {
         // Grab diagnostics from both cloud-init logs
         let grab_log = |path: &str| -> String {
-            Command::new("limactl")
+            private_limactl()
                 .args([
                     "shell",
                     BUILDER_NAME,
@@ -1343,7 +1359,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
         guest_user,
         "provision script",
         |path| {
-            Command::new("limactl")
+            private_limactl()
                 .args([
                     "shell",
                     BUILDER_NAME,
@@ -1364,7 +1380,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
 /// Tail of the builder's cloud-init log, formatted as a trailing section for
 /// the missing-binaries error. Empty when the log is unavailable or blank.
 fn builder_log_tail() -> String {
-    let log_tail = Command::new("limactl")
+    let log_tail = private_limactl()
         .args([
             "shell",
             BUILDER_NAME,
@@ -1921,6 +1937,54 @@ fn lima_name_for(name: &InstanceName) -> String {
     format!("{LIMA_PREFIX}{name}")
 }
 
+/// Restrict files created by Lima, including disks and transient builder state.
+fn private_limactl() -> Command {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = Command::new("limactl");
+    // SAFETY: umask is async-signal-safe and only affects the child process.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    command
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_private_storage() -> Result<()> {
+    let home = lima_home()?;
+    crate::fs_util::private_dir(&home)?;
+    for entry in fs::read_dir(&home)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(LIMA_PREFIX) {
+            continue;
+        }
+        seal_instance_storage(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn seal_instance_storage(directory: &Path) -> Result<()> {
+    match directory.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => crate::fs_util::private_dir(directory)?,
+    }
+    for path in [
+        disk_path_at(directory)?,
+        directory.join("basedisk"),
+        directory.join("ssh.key"),
+    ] {
+        match path.symlink_metadata() {
+            Ok(_) => crate::private_storage::private_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn lima_home() -> Result<PathBuf> {
     // LIMA_HOME env var, or ~/.lima
     if let Ok(home) = std::env::var("LIMA_HOME") {
@@ -1977,7 +2041,7 @@ fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Val
 }
 
 fn limactl_list_output() -> Result<String> {
-    let output = Command::new("limactl")
+    let output = private_limactl()
         .args(["list", "--json"])
         .output()
         .context("Failed to run limactl list")?;
@@ -1997,6 +2061,73 @@ fn limactl_list_output() -> Result<String> {
 mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
+
+    #[test]
+    fn private_lima_child_creates_private_files_and_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let shim = root.path().join("limactl");
+        fs::write(&shim, "#!/bin/sh\n: > \"$COOP_PRIVATE_LIMA_TEST\"\n/bin/mkdir \"$COOP_PRIVATE_LIMA_TEST-dir\"\n").unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.path().join("disk");
+        let status = private_limactl()
+            .env("PATH", root.path())
+            .env("COOP_PRIVATE_LIMA_TEST", &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(root.path().join("disk-dir"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn lima_storage_repairs_disk_modes_and_accepts_only_legacy_disk_alias() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("coop-test");
+        fs::create_dir(&directory).unwrap();
+        for name in ["diffdisk", "basedisk", "ssh.key"] {
+            fs::write(directory.join(name), "canary").unwrap();
+            fs::set_permissions(directory.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        symlink("diffdisk", directory.join("disk")).unwrap();
+        assert_eq!(
+            disk_path_at(&directory).unwrap(),
+            directory.join("diffdisk")
+        );
+        seal_instance_storage(&directory).unwrap();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in ["diffdisk", "basedisk", "ssh.key"] {
+            assert_eq!(
+                fs::metadata(directory.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), "canary");
+        }
+        fs::remove_file(directory.join("disk")).unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, "untouched").unwrap();
+        symlink(&outside, directory.join("disk")).unwrap();
+        assert!(seal_instance_storage(&directory).is_err());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "untouched");
+    }
 
     #[test]
     fn backend_lima_state_gates_disk_and_metadata_mutations() {

@@ -135,11 +135,21 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   strategy to Off and disable the PAT wizard for that invocation. This does
   not scrub existing guest credentials or block explicit environment entries
   or one-shot clone authentication; see [GitHub auth](configuration.md#github-auth).
-- **Secret files stay `0600`, dirs `0700`.** File-backend PATs live at
-  `<state_dir>/github-pat/<account>.txt` (`secret_store.rs:store_file`); all
-  managed writes go through `fs_util::atomic_write_with_mode` / `atomic_write_ssh`,
-  which never relax permissions. A host `~/.grok/auth.json` copied into the
-  guest is `chmod 0600` after `scp` (`backend.rs:restrict_guest_grok_auth`).
+- **Private host storage is enforced.** Managed data/image/instance/state
+  directories use `0700`; persisted environment overrides, JSON state, tokens,
+  SSH private keys, and VM disks use `0600`. Atomic temporary files are private
+  before content is written. Existing managed state is repaired before use,
+  without entering mounted guest filesystems. Directory traversal rejects
+  symlinks except root-owned OS ancestor aliases, foreign ownership, and
+  non-sticky writable ancestors; sensitive files reject symlinks and hardlinks.
+  Lima’s same-directory `disk` → `diffdisk` alias is permitted. macOS ancestor
+  ACLs must not grant write/control access. Extended ACLs are cleared on private directories and user-owned files.
+  Root-owned Firecracker disks are chmodded with sudo when needed; their Unix
+  ACL mask is restricted by `0600`. Lima uses a private child umask, reseals disks after startup, and protects
+  its coop directories separately from `data_dir`. See
+  [private host storage](configuration.md#private-host-storage). A host
+  `~/.grok/auth.json` copied into the guest is `chmod 0600` after `scp`
+  (`backend.rs:restrict_guest_grok_auth`).
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing

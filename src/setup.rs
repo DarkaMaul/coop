@@ -99,7 +99,7 @@ impl TemplateConfig {
 /// Run the full setup: check prerequisites, install Firecracker,
 /// fetch kernel, and build template rootfs.
 pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-    fs::create_dir_all(&cfg.data_dir).context("Failed to create data directory")?;
+    crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
     check_host_requirements()?;
     install_system_packages(opts.skip_confirm)?;
@@ -218,13 +218,16 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
 /// supports it, full copy otherwise). Runs as root because instance and
 /// template rootfs files are root-owned on Firecracker.
 fn reflink_copy(src: &Path, dst: &Path) -> Result<()> {
+    crate::private_storage::private_file(src)?;
+    crate::fs_util::private_dir(dst.parent().context("Disk has no parent")?)?;
     Cmd::new("cp")
         .arg("--reflink=auto")
         .arg(src)
         .arg(dst)
         .sudo()
         .run()
-        .with_context(|| format!("Failed to copy {} -> {}", src.display(), dst.display()))
+        .with_context(|| format!("Failed to copy {} -> {}", src.display(), dst.display()))?;
+    crate::private_storage::private_file(dst)
 }
 
 /// Save a stopped instance's rootfs as image `image`'s template.
@@ -240,7 +243,7 @@ pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageNa
     }
 
     let image_dir = cfg.image_dir(image);
-    fs::create_dir_all(&image_dir)
+    crate::fs_util::private_dir(&image_dir)
         .with_context(|| format!("Failed to create image dir {}", image_dir.display()))?;
 
     let template = cfg.template_path_for(image);
@@ -1456,9 +1459,10 @@ fn create_ext4_image(cfg: &CoopConfig, output_path: &Path) -> Result<()> {
         cfg.vm.template_size_gib
     );
     if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::fs_util::private_dir(parent)?;
     }
 
+    crate::fs_util::atomic_write_with_mode(output_path, "", 0o600)?;
     let unpack_dir = cfg.data_dir.join("squashfs-root");
 
     let size_arg = format!("{}G", cfg.vm.template_size_gib);
@@ -1751,6 +1755,42 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires passwordless sudo for the Firecracker disk copy path"]
+    fn private_disk_reflink_copy_and_root_owned_migration() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let source = root.path().join("rootfs-template.ext4");
+        let destination = root.path().join("rootfs.ext4");
+        fs::write(&source, "disk-canary").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            Command::new("sudo")
+                .args(["-n", "chown", "0"])
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        reflink_copy(&source, &destination).unwrap();
+        for path in [&source, &destination] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let output = Command::new("sudo")
+                .args(["-n", "cat"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"disk-canary");
+        }
+    }
 
     #[test]
     fn system_packages_without_apt() {

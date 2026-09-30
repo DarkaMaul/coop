@@ -1905,7 +1905,7 @@ impl<'de> Deserialize<'de> for ImageName {
 ///
 /// Returns the open file handle — the lock is held until dropped.
 fn lock_dir(dir: &Path) -> Result<File> {
-    fs::create_dir_all(dir)
+    crate::fs_util::private_dir(dir)
         .with_context(|| format!("Failed to create directory {}", dir.display()))?;
     let lock_path = dir.join(".lock");
     let file = File::create(&lock_path)

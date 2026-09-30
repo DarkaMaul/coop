@@ -154,6 +154,21 @@ exclude_re = [
   "\\bstore_keychain\\b",
   "find-generic-password",
 
+  # private_storage.rs — root-owned disk repair invokes sudo; host integration
+  # covers that branch. The user-owned mode and ACL paths have unit regressions.
+  "src/private_storage\\.rs:.*\\bprivate_file\\b",
+
+  # Darwin ACL functions are compiled out on the Linux mutation host; native
+  # macOS unit tests exercise allow/deny ACLs and ACL removal.
+  "mac_acl::",
+
+  # Descriptor/creation syscall adapters; pure alias, errno, and creation
+  # decisions remain in scope. Closed-fd, strict-umask, and root-alias probes
+  # cover the adapters, including the privileged ownership fixture.
+  "\\bopen_directory_at\\b",
+  "\\broot_owned_symlink_at\\b",
+  "\\bcreate_private_directory_at\\b",
+
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
   "\\block_sibling_bounded\\b",
