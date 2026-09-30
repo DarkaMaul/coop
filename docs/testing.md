@@ -137,6 +137,32 @@ and round-trip regressions must fail, respectively. Removing export diagnostic
 redaction must fail the assignment-error regression. Restore the code and
 rerun the tests after each check.
 
+## Host subprocess boundary tests
+
+Changes that route project or guest configuration into host launchers need both
+an intended guest result and evidence that the host launch context is unaffected.
+A successful guest `printenv` or an assertion on the forwarding map alone does
+not establish isolation. Trace the input from local/fetched project parsing
+through config merging and saved-state replay to all applicable launch variants
+(interactive, non-interactive, stdin, and output capture).
+
+Use disposable fixtures with no real credentials or user configuration. For
+executable lookup, put a marker-writing replacement tool in a project-controlled
+directory and verify it never runs on the host. Pair that negative check with a
+positive witness that the intended launcher ran and the guest received the
+value. Inspect the child environment for loader and tool-control names too;
+using an absolute executable does not cover those controls. A fake launcher can
+observe host isolation, while a real transport fixture must verify guest
+restoration. Keep platform-specific controls tied to the platform that consumes
+them and report missing platform coverage.
+
+Deliberately reintroduce the unsafe source-to-sink connection and require the
+host-isolation assertion to fail; separately break guest delivery and require
+the positive witness to fail. Do this even when the launch code is excluded
+from cargo-mutants. Run such checks only in an authorized test environment;
+read-only CI review must report them as unrun when contributor execution is
+forbidden. The concrete forwarding checks above implement this pattern for SSH.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real
