@@ -1,7 +1,9 @@
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
-use std::fs;
-use std::io::{BufRead, BufReader, Write as _};
+use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
+use crate::fs_util::{PrivateDir, PrivateEntryType};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
@@ -84,6 +87,7 @@ pub fn create_and_start(
     let name = lima_name(inst);
     seal_instance_storage(&lima_home()?.join(&name))?;
     crate::private_storage::prepare_directory(&cfg.image_dir(&inst.image))?;
+    let image_dir = PrivateDir::open_existing(&cfg.image_dir(&inst.image))?;
     let template_path = cfg.lima_template_path(&inst.image);
     let base_img = cfg.lima_base_path(&inst.image);
 
@@ -95,23 +99,10 @@ pub fn create_and_start(
             inst.image,
         );
     }
+    let mut template_file =
+        image_dir.open_regular(template_path.file_name().context("Template has no name")?)?;
 
-    // When mounts are requested, generate a per-instance template that
-    // includes them. Otherwise use the shared image template.
-    let effective_template = if mounts.is_empty() {
-        template_path.clone()
-    } else {
-        let inst_template = inst.dir.join("lima-template.yaml");
-        let base_yaml = fs::read_to_string(&template_path)
-            .with_context(|| format!("Failed to read {}", template_path.display()))?;
-        let yaml = inject_mounts(&base_yaml, mounts)?;
-        fs::write(&inst_template, &yaml)
-            .with_context(|| format!("Failed to write {}", inst_template.display()))?;
-        for m in mounts {
-            tracing::info!("Mount: {} -> {}", m.host_path.display(), m.guest_path);
-        }
-        inst_template
-    };
+    let effective_template = instance_template(inst, mounts, &mut template_file, &template_path)?;
 
     // Clean up leftover Lima instance from a previous failed start
     if let Some(state) = lima_state(&inst.name)? {
@@ -133,12 +124,14 @@ pub fn create_and_start(
 
     tracing::info!("Creating Lima instance '{name}'");
 
+    let base_file =
+        image_dir.open_regular(base_img.file_name().context("Base image has no name")?)?;
     let disk = disk_gib.unwrap_or_else(|| {
         // Default to the base image size (rounded up to GiB) so the
         // instance disk is never smaller than the golden image it was
         // cloned from.  Fall back to template_size_gib if the file
         // size can't be read.
-        base_image_size_gib(&base_img).unwrap_or(cfg.vm.template_size_gib)
+        base_image_size_gib(&base_file).unwrap_or(cfg.vm.template_size_gib)
     });
     let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
     let mut child = private_limactl()
@@ -183,6 +176,36 @@ pub fn create_and_start(
     permissions?;
     tracing::info!("Lima instance '{name}' started");
     Ok(())
+}
+
+/// Generate a private per-instance Lima template when mounts are requested.
+fn instance_template(
+    inst: &Instance,
+    mounts: &[crate::config::Mount],
+    template_file: &mut File,
+    template_path: &Path,
+) -> Result<PathBuf> {
+    if mounts.is_empty() {
+        return Ok(template_path.to_path_buf());
+    }
+    let inst_template = inst.dir.join("lima-template.yaml");
+    let mut base_yaml = String::new();
+    template_file
+        .read_to_string(&mut base_yaml)
+        .with_context(|| format!("Failed to read {}", template_path.display()))?;
+    let yaml = inject_mounts(&base_yaml, mounts)?;
+    let instance_dir = PrivateDir::create(&inst.dir)?;
+    instance_dir
+        .write_atomic_private(OsStr::new("lima-template.yaml"), yaml.as_bytes(), 0o600)
+        .with_context(|| format!("Failed to write {}", inst_template.display()))?;
+    for mount in mounts {
+        tracing::info!(
+            "Mount: {} -> {}",
+            mount.host_path.display(),
+            mount.guest_path
+        );
+    }
+    Ok(inst_template)
 }
 
 /// Start an existing stopped Lima instance (no template — resumes in place).
@@ -300,20 +323,8 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 /// to match, so the next start sees the grown size. Cloud-init's
 /// `growpart` expands the partition and filesystem on next boot.
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
-    let disk = disk_path(inst)?;
-
-    if !disk.exists() {
-        bail!(
-            "Lima disk not found at {}.\n\
-             Is instance '{}' created?",
-            disk.display(),
-            inst.name,
-        );
-    }
-
-    let current_bytes = std::fs::metadata(&disk)
-        .with_context(|| format!("Failed to stat {}", disk.display()))?
-        .len();
+    let (_disk_dir, disk, disk_file) = open_instance_disk(inst, DiskAccess::Update)?;
+    let current_bytes = disk_file.metadata()?.len();
     let current_gib = current_bytes / (1024 * 1024 * 1024);
     let new_gib = u64::from(new_size.as_u32());
 
@@ -337,15 +348,17 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
     // without updating that field makes the next start look like a
     // shrink, which Lima rejects.
     let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
-    let original = fs::read_to_string(&yaml_path)
-        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+    let yaml_dir =
+        PrivateDir::open_existing(yaml_path.parent().context("Lima YAML has no parent")?)?;
+    let original = read_managed_yaml(&yaml_dir, &yaml_path)?;
     let disk_value = format!("\"{}GiB\"", new_size.as_u32());
     let edited = set_yaml_scalar(&original, "disk", &disk_value)
         .with_context(|| format!("No top-level 'disk' key in {}", yaml_path.display()))?;
-    crate::fs_util::atomic_write_with_mode(&yaml_path, &edited, 0o644)?;
+    yaml_dir.write_atomic_private(yaml_name(), edited.as_bytes(), 0o644)?;
 
     let restore_yaml = || {
-        if let Err(restore) = crate::fs_util::atomic_write_with_mode(&yaml_path, &original, 0o644) {
+        if let Err(restore) = yaml_dir.write_atomic_private(yaml_name(), original.as_bytes(), 0o644)
+        {
             tracing::error!(
                 "Failed to restore {} after a failed truncate: {restore}",
                 yaml_path.display()
@@ -353,22 +366,9 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
         }
     };
 
-    match Command::new("truncate")
-        .arg("-s")
-        .arg(format!("{new_size}G"))
-        .arg(&disk)
-        .status()
-        .context("Failed to run truncate")
-    {
-        Ok(status) if status.success() => {}
-        Ok(_) => {
-            restore_yaml();
-            bail!("truncate failed for {}", disk.display());
-        }
-        Err(e) => {
-            restore_yaml();
-            return Err(e);
-        }
+    if let Err(error) = disk_file.set_len(new_gib * 1024 * 1024 * 1024) {
+        restore_yaml();
+        return Err(error).with_context(|| format!("Failed to resize {}", disk.display()));
     }
 
     tracing::info!(
@@ -395,8 +395,9 @@ pub fn set_machine_resources(
     start_after: bool,
 ) -> Result<()> {
     let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
-    let original = fs::read_to_string(&yaml_path)
-        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+    let yaml_dir =
+        PrivateDir::open_existing(yaml_path.parent().context("Lima YAML has no parent")?)?;
+    let original = read_managed_yaml(&yaml_dir, &yaml_path)?;
 
     let mut edited = original.clone();
     if let Some(vcpus) = vcpus {
@@ -409,11 +410,12 @@ pub fn set_machine_resources(
             .with_context(|| format!("No top-level 'memory' key in {}", yaml_path.display()))?;
     }
 
-    crate::fs_util::atomic_write_with_mode(&yaml_path, &edited, 0o644)?;
+    yaml_dir.write_atomic_private(yaml_name(), edited.as_bytes(), 0o644)?;
 
     // Lima applies cpus/memory only at start, so boot to validate + apply.
     if let Err(e) = start_existing(cfg, inst) {
-        if let Err(restore) = crate::fs_util::atomic_write_with_mode(&yaml_path, &original, 0o644) {
+        if let Err(restore) = yaml_dir.write_atomic_private(yaml_name(), original.as_bytes(), 0o644)
+        {
             tracing::error!(
                 "Failed to restore {} after a failed reconfigure: {restore}",
                 yaml_path.display()
@@ -468,53 +470,82 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 /// so it points at the new base. The caller has gated on the instance
 /// being stopped and decided whether overwriting is allowed.
 pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
-    let src = disk_path(inst)?;
-    if !src.exists() {
-        bail!(
-            "Lima disk not found at {}.\n\
-             Is instance '{}' created?",
-            src.display(),
-            inst.name,
-        );
-    }
+    let (_disk_dir, src, source) = open_instance_disk(inst, DiskAccess::Read)?;
 
     let image_dir = cfg.image_dir(image);
-    crate::fs_util::private_dir(&image_dir)
+    let image_dir_handle = PrivateDir::create(&image_dir)
         .with_context(|| format!("Failed to create image dir {}", image_dir.display()))?;
 
     let base_img = cfg.lima_base_path(image);
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
-    crate::private_storage::private_file(&src)?;
-    fs::copy(&src, &base_img)
+    image_dir_handle
+        .copy_atomic_sparse(
+            base_img.file_name().context("Base image has no name")?,
+            &source,
+            0o600,
+        )
         .with_context(|| format!("Failed to copy {} -> {}", src.display(), base_img.display()))?;
-
-    crate::private_storage::private_file(&base_img)?;
     generate_start_template(cfg, image)
 }
 
 /// Replace a stopped instance's disk with image `image`'s base image.
 pub fn restore_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
     let base_img = cfg.lima_base_path(image);
-    if !base_img.exists() {
-        bail!("No image '{image}' found at {}.", base_img.display());
-    }
-
-    let dst = disk_path(inst)?;
-    if !dst.exists() {
-        bail!(
-            "Lima disk not found at {}.\n\
-             Is instance '{}' created?",
-            dst.display(),
-            inst.name,
-        );
-    }
+    let image_dir =
+        PrivateDir::open_existing(base_img.parent().context("Base image has no parent")?)?;
+    let source = image_dir
+        .open_regular(base_img.file_name().context("Base image has no name")?)
+        .with_context(|| format!("No image '{image}' found at {}.", base_img.display()))?;
+    let (disk_dir, dst, _target) = open_instance_disk(inst, DiskAccess::Read)?;
 
     tracing::info!("Restoring instance '{}' from image '{image}'", inst.name);
-    crate::private_storage::private_file(&base_img)?;
-    fs::copy(&base_img, &dst)
+    disk_dir
+        .copy_atomic_sparse(
+            dst.file_name().context("Lima disk has no name")?,
+            &source,
+            0o600,
+        )
         .with_context(|| format!("Failed to copy {} -> {}", base_img.display(), dst.display()))?;
-    crate::private_storage::private_file(&dst)?;
     Ok(())
+}
+
+fn yaml_name() -> &'static OsStr {
+    OsStr::new("lima.yaml")
+}
+
+fn read_managed_yaml(dir: &PrivateDir, path: &Path) -> Result<String> {
+    let mut file = dir
+        .open_regular_with_mode(yaml_name(), 0o644)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(content)
+}
+
+#[derive(Clone, Copy)]
+enum DiskAccess {
+    Read,
+    Update,
+}
+
+fn open_instance_disk(inst: &Instance, access: DiskAccess) -> Result<(PrivateDir, PathBuf, File)> {
+    let directory = lima_home()?.join(lima_name(inst));
+    let dir = PrivateDir::open_existing(&directory)?;
+    let name = disk_name_at(&dir, &directory)?;
+    let path = directory.join(name);
+    let opened = match access {
+        DiskAccess::Read => dir.open_regular(name),
+        DiskAccess::Update => dir.open_regular_for_update(name),
+    };
+    let file = opened.with_context(|| {
+        format!(
+            "Lima disk not found at {}. Is instance '{}' created?",
+            path.display(),
+            inst.name
+        )
+    })?;
+    Ok((dir, path, file))
 }
 
 /// Path to the VM disk for a Lima instance.
@@ -529,18 +560,31 @@ pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
 }
 
 fn disk_path_at(dir: &Path) -> Result<PathBuf> {
-    let new_path = dir.join("disk");
-    match new_path.symlink_metadata() {
-        Ok(metadata) if metadata.is_symlink() => {
-            let target = fs::read_link(&new_path)?;
-            if target != Path::new("diffdisk") && target != dir.join("diffdisk") {
-                bail!("Unexpected Lima disk alias: {}", new_path.display());
+    let directory = PrivateDir::open_existing(dir)?;
+    Ok(dir.join(disk_name_at(&directory, dir)?))
+}
+
+fn disk_name_at(dir: &PrivateDir, path: &Path) -> Result<&'static OsStr> {
+    match dir.entry_type(OsStr::new("disk")) {
+        Ok(PrivateEntryType::Symlink) => {
+            let target = dir.read_link(OsStr::new("disk"))?;
+            if target != Path::new("diffdisk") && target != path.join("diffdisk") {
+                bail!(
+                    "Unexpected Lima disk alias: {}",
+                    path.join("disk").display()
+                );
             }
-            Ok(dir.join("diffdisk"))
+            Ok(OsStr::new("diffdisk"))
         }
-        Ok(_) => Ok(new_path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(dir.join("diffdisk")),
-        Err(error) => Err(error.into()),
+        Ok(_) => Ok(OsStr::new("disk")),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(OsStr::new("diffdisk"))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -640,10 +684,8 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let cpus = info["cpus"].as_u64().unwrap_or(0);
     let memory_bytes = info["memory"].as_u64().unwrap_or(0);
     let memory_mib = memory_bytes / (1024 * 1024);
-    let disk_gib = disk_path(inst)
-        .and_then(|p| {
-            std::fs::metadata(&p).with_context(|| format!("Failed to stat {}", p.display()))
-        })
+    let disk_gib = open_instance_disk(inst, DiskAccess::Read)
+        .and_then(|(_, _, file)| file.metadata().map_err(Into::into))
         .map_or_else(
             |_| info["disk"].as_u64().unwrap_or(0) / (1024 * 1024 * 1024),
             |m| m.len() / (1024 * 1024 * 1024),
@@ -680,33 +722,29 @@ pub fn stream_logs(inst: &Instance, mode: LogMode) -> Result<()> {
     // Lima logs are in ~/.lima/<name>/serial.log
     let lima_dir = lima_home()?.join(&name);
     seal_instance_storage(&lima_dir)?;
+    let dir = PrivateDir::open_existing(&lima_dir)?;
     let serial_log = lima_dir.join("serial.log");
-    let ha_log = lima_dir.join("ha.stderr.log");
-
-    // Prefer serial.log, fall back to ha.stderr.log
-    let log_path = if serial_log.exists() {
-        serial_log
-    } else if ha_log.exists() {
-        ha_log
-    } else {
-        bail!(
-            "No log files found for Lima instance '{name}'.\n\
-             Expected: {}",
-            serial_log.display()
-        );
+    let file = match dir.open_regular(OsStr::new("serial.log")) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            dir.open_regular(OsStr::new("ha.stderr.log"))
+                .with_context(|| {
+                    format!(
+                        "No log files found for Lima instance '{name}'. Expected: {}",
+                        serial_log.display()
+                    )
+                })?
+        }
+        Err(error) => return Err(error),
     };
 
     match mode {
-        LogMode::Follow => {
-            let mut child = Command::new("tail")
-                .arg("-f")
-                .arg(&log_path)
-                .spawn()
-                .context("Failed to tail log file")?;
-            child.wait().context("Log streaming interrupted")?;
-        }
+        LogMode::Follow => follow_open_log(file)?,
         LogMode::Snapshot => {
-            let file = fs::File::open(&log_path).context("Failed to open log file")?;
             let reader = BufReader::new(file);
             for line in reader.lines() {
                 let line = line.context("Failed to read log line")?;
@@ -714,6 +752,39 @@ pub fn stream_logs(inst: &Instance, mode: LogMode) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Follow the verified log descriptor. Retain tail's last-ten-lines display
+/// and keep reading this inode if Lima renames or rotates the log path.
+fn follow_open_log(file: File) -> Result<()> {
+    let mut reader = BufReader::new(file);
+    let mut recent = VecDeque::with_capacity(10);
+    let mut line = String::new();
+    while reader.read_line(&mut line)? != 0 {
+        if recent.len() == 10 {
+            recent.pop_front();
+        }
+        recent.push_back(std::mem::take(&mut line));
+    }
+    for line in recent {
+        print_log_line(&line)?;
+    }
+    loop {
+        if reader.read_line(&mut line)? != 0 {
+            print_log_line(&line)?;
+            line.clear();
+            continue;
+        }
+        if reader.get_ref().metadata()?.len() < reader.stream_position()? {
+            reader.seek(SeekFrom::Start(0))?;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn print_log_line(line: &str) -> Result<()> {
+    writeln!(std::io::stdout(), "{}", line.trim_end_matches(['\r', '\n']))?;
     Ok(())
 }
 
@@ -793,9 +864,18 @@ fn provision_script_hash(
     guest_user: &GuestUser,
 ) -> Sha256Hash {
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
-    let pubkey = fs::read_to_string(&pubkey_path).unwrap_or_default();
+    let pubkey = read_public_key(&pubkey_path).unwrap_or_default();
     let script = compose_provision_script(pubkey.trim(), profiles, oci_features, guest_user);
     Sha256Hash::of(&script)
+}
+
+fn read_public_key(path: &Path) -> Result<String> {
+    let dir = PrivateDir::open_existing(path.parent().context("Public key has no parent")?)?;
+    let mut file =
+        dir.open_regular_with_mode(path.file_name().context("Public key has no name")?, 0o644)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 /// Returns `true` if the golden image needs rebuilding.
@@ -854,7 +934,7 @@ fn build_golden_image(
     );
 
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
-    let pubkey = fs::read_to_string(&pubkey_path)
+    let pubkey = read_public_key(&pubkey_path)
         .with_context(|| format!("Failed to read SSH public key at {}", pubkey_path.display()))?;
 
     // Clean up any leftover builder instance from a previous failed build
@@ -868,35 +948,31 @@ fn build_golden_image(
     // Clean up leftover staging image from a previous failed build
     let base_img = cfg.lima_base_path(image);
     let staging = base_img.with_extension("img.new");
+    let image_dir = PrivateDir::create(base_img.parent().context("Base image has no parent")?)?;
+    let staging_name = staging.file_name().context("Staging image has no name")?;
     if staging.exists()
-        && let Err(e) = fs::remove_file(&staging)
+        && let Err(e) = image_dir.remove_child(staging_name)
     {
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
     }
 
     // Generate builder template with full provisioning
     let builder_template = cfg.data_dir.join("lima-builder.yaml");
-    let provision_script =
-        compose_provision_script(pubkey.trim(), profiles, oci_features, guest_user);
-    let yaml = compose_template_yaml(cfg, &provision_script);
-    fs::write(&builder_template, &yaml).with_context(|| {
-        format!(
-            "Failed to write builder template at {}",
-            builder_template.display()
-        )
-    })?;
+    let data_dir = PrivateDir::open_existing(&cfg.data_dir)?;
+    let builder_template_name = builder_template
+        .file_name()
+        .context("Builder template has no name")?;
+    write_builder_template(
+        &data_dir,
+        &builder_template,
+        cfg,
+        pubkey.trim(),
+        profiles,
+        oci_features,
+        guest_user,
+    )?;
 
-    if !profiles.is_empty() {
-        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
-        eprintln!("  Profiles: {}", names.join(", "));
-    }
-    if !oci_features.is_empty() {
-        let names: Vec<&str> = oci_features
-            .iter()
-            .map(|f| f.installed.id.as_str())
-            .collect();
-        eprintln!("  Devcontainer OCI features: {}", names.join(", "));
-    }
+    report_builder_inputs(profiles, oci_features);
 
     // Build to staging path — old image is never touched
     let result = run_builder_vm(
@@ -908,23 +984,13 @@ fn build_golden_image(
         builder_timeout,
     );
 
-    // Always clean up builder resources
-    eprintln!("  Cleaning up builder VM...");
-    if let Err(e) = private_limactl()
-        .args(["delete", "--force", BUILDER_NAME])
-        .status()
-    {
-        tracing::warn!("Failed to delete builder VM (non-fatal): {e}");
-    }
-    if let Err(e) = fs::remove_file(&builder_template) {
-        tracing::debug!("Failed to remove builder template (non-fatal): {e}");
-    }
+    cleanup_builder(&data_dir, builder_template_name);
 
     let baked = match result {
         Ok(lists) => lists,
         Err(e) => {
             // Clean up failed staging image
-            if let Err(rm_err) = fs::remove_file(&staging) {
+            if let Err(rm_err) = image_dir.remove_child(staging_name) {
                 tracing::debug!("Failed to remove staging image (non-fatal): {rm_err}");
             }
             return Err(e);
@@ -932,16 +998,23 @@ fn build_golden_image(
     };
 
     // Swap staging into place — old image is replaced atomically
-    fs::rename(&staging, &base_img).with_context(|| {
-        format!(
-            "Failed to swap staging image {} -> {}",
-            staging.display(),
-            base_img.display()
+    image_dir
+        .rename_child(
+            staging_name,
+            base_img.file_name().context("Base image has no name")?,
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "Failed to swap staging image {} -> {}",
+                staging.display(),
+                base_img.display()
+            )
+        })?;
 
     #[expect(clippy::cast_precision_loss, reason = "file size fits in f64")]
-    let size_gib = fs::metadata(&base_img)
+    let size_gib = image_dir
+        .open_regular(base_img.file_name().context("Base image has no name")?)
+        .and_then(|file| file.metadata().map_err(Into::into))
         .map(|m| m.len() as f64 / (1024.0 * 1024.0 * 1024.0))
         .unwrap_or(0.0);
     eprintln!("  Golden image: {} ({size_gib:.1} GiB)", base_img.display());
@@ -966,6 +1039,52 @@ fn build_golden_image(
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn report_builder_inputs(profiles: &[ProfileDef], oci_features: &[ResolvedFeature]) {
+    if !profiles.is_empty() {
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        eprintln!("  Profiles: {}", names.join(", "));
+    }
+    if !oci_features.is_empty() {
+        let names: Vec<&str> = oci_features
+            .iter()
+            .map(|f| f.installed.id.as_str())
+            .collect();
+        eprintln!("  Devcontainer OCI features: {}", names.join(", "));
+    }
+}
+
+fn cleanup_builder(data_dir: &PrivateDir, template_name: &OsStr) {
+    eprintln!("  Cleaning up builder VM...");
+    if let Err(error) = private_limactl()
+        .args(["delete", "--force", BUILDER_NAME])
+        .status()
+    {
+        tracing::warn!("Failed to delete builder VM (non-fatal): {error}");
+    }
+    if let Err(error) = data_dir.remove_child(template_name) {
+        tracing::debug!("Failed to remove builder template (non-fatal): {error}");
+    }
+}
+
+fn write_builder_template(
+    dir: &PrivateDir,
+    path: &Path,
+    cfg: &CoopConfig,
+    pubkey: &str,
+    profiles: &[ProfileDef],
+    oci_features: &[ResolvedFeature],
+    guest_user: &GuestUser,
+) -> Result<()> {
+    let script = compose_provision_script(pubkey, profiles, oci_features, guest_user);
+    let yaml = compose_template_yaml(cfg, &script);
+    dir.write_atomic_private(
+        path.file_name().context("Builder template has no name")?,
+        yaml.as_bytes(),
+        0o600,
+    )
+    .with_context(|| format!("Failed to write builder template at {}", path.display()))
 }
 
 /// Start the builder VM, install marketplaces/plugins, clean
@@ -1051,27 +1170,32 @@ fn run_builder_vm(
     // Lima v2.1.0 renamed "diffdisk" to "disk"; try new name first.
     eprintln!("  Extracting disk image...");
     let lima_dir = lima_home()?.join(BUILDER_NAME);
-    let src_disk = disk_path_at(&lima_dir)?;
-    if !src_disk.exists() {
-        bail!(
+    let lima_dir_handle = PrivateDir::open_existing(&lima_dir)?;
+    let disk_name = disk_name_at(&lima_dir_handle, &lima_dir)?;
+    let src_disk = lima_dir.join(disk_name);
+    let source = lima_dir_handle.open_regular(disk_name).with_context(|| {
+        format!(
             "Builder disk not found at {}. Lima may use a different disk layout.",
             src_disk.display()
-        );
-    }
-    if let Some(parent) = output_path.parent() {
-        crate::fs_util::private_dir(parent)
-            .with_context(|| format!("Failed to create dir {}", parent.display()))?;
-    }
-    crate::private_storage::private_file(&src_disk)?;
-    fs::copy(&src_disk, output_path).with_context(|| {
-        format!(
-            "Failed to copy disk from {} to {}",
-            src_disk.display(),
-            output_path.display(),
         )
     })?;
-
-    crate::private_storage::private_file(output_path)?;
+    let output_dir =
+        PrivateDir::create(output_path.parent().context("Output image has no parent")?)?;
+    output_dir
+        .copy_atomic_sparse(
+            output_path
+                .file_name()
+                .context("Output image has no name")?,
+            &source,
+            0o600,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to copy disk from {} to {}",
+                src_disk.display(),
+                output_path.display(),
+            )
+        })?;
     Ok(baked)
 }
 
@@ -1189,7 +1313,9 @@ fn dump_builder_logs() {
     // 1. Host-side: Lima serial log
     if let Ok(lima_home) = lima_home() {
         let serial = lima_home.join(BUILDER_NAME).join("serial.log");
-        if let Ok(content) = std::fs::read_to_string(&serial) {
+        let content = PrivateDir::open_existing(&lima_home.join(BUILDER_NAME))
+            .and_then(|dir| dir.read_to_string(OsStr::new("serial.log")));
+        if let Ok(content) = content {
             let lines: Vec<&str> = content.lines().collect();
             let tail: Vec<&str> = lines
                 .iter()
@@ -1413,10 +1539,19 @@ fn builder_log_tail() -> String {
 fn generate_start_template(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
     eprintln!("\n=> Generating fast-start template");
 
-    let base_img = cfg
-        .lima_base_path(image)
-        .canonicalize()
-        .context("Golden image not found — run setup first")?;
+    let base_img = cfg.lima_base_path(image);
+    let image_dir =
+        PrivateDir::open_existing(base_img.parent().context("Golden image has no parent")?)?;
+    let _base_file = image_dir
+        .open_regular(base_img.file_name().context("Golden image has no name")?)
+        .context("Golden image not found or invalid — run setup first")?;
+    // The containing directory has been checked and the opened image cannot
+    // be a symlink. Keep the durable path for Lima, which reopens it itself.
+    let base_img = if base_img.is_absolute() {
+        base_img
+    } else {
+        std::env::current_dir()?.join(base_img)
+    };
 
     let arch = if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -1458,7 +1593,14 @@ containerd:
     );
 
     let template_path = cfg.lima_template_path(image);
-    fs::write(&template_path, &yaml)
+    let template_dir =
+        PrivateDir::create(template_path.parent().context("Template has no parent")?)?;
+    template_dir
+        .write_atomic_private(
+            template_path.file_name().context("Template has no name")?,
+            yaml.as_bytes(),
+            0o600,
+        )
         .with_context(|| format!("Failed to write {}", template_path.display()))?;
 
     eprintln!("  Template: {}", template_path.display());
@@ -1837,11 +1979,11 @@ fn wait_for_lima_ssh(
 /// Returns `None` if the file is missing or has no usable `Port` line —
 /// both signal "not ready yet" and the caller will retry.
 fn get_lima_ssh_port(name: &InstanceName) -> Option<u16> {
-    let config_path = lima_home()
+    let config_dir = lima_home().ok()?.join(lima_name_for(name));
+    let content = PrivateDir::open_existing(&config_dir)
         .ok()?
-        .join(lima_name_for(name))
-        .join("ssh.config");
-    let content = fs::read_to_string(&config_path).ok()?;
+        .read_to_string(OsStr::new("ssh.config"))
+        .ok()?;
     parse_ssh_config_port(&content)
 }
 
@@ -1883,8 +2025,8 @@ fn reap_in_background(child: std::process::Child) {
 // ── Lima helpers ──────────────────────────────────────────────
 
 /// Read a raw disk image's file size and convert to GiB (rounded up).
-fn base_image_size_gib(path: &Path) -> Option<GiB> {
-    let bytes = fs::metadata(path).ok()?.len();
+fn base_image_size_gib(file: &File) -> Option<GiB> {
+    let bytes = file.metadata().ok()?.len();
     let gib = bytes.div_ceil(1024 * 1024 * 1024);
     #[expect(clippy::cast_possible_truncation, reason = "disk images < 4 TiB")]
     GiB::new(gib as u32)
@@ -1958,35 +2100,50 @@ fn private_limactl() -> Command {
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_private_storage() -> Result<()> {
     let home = lima_home()?;
-    crate::fs_util::private_dir(&home)?;
-    for entry in fs::read_dir(&home)? {
-        let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with(LIMA_PREFIX) {
+    let home_dir = PrivateDir::create(&home)?;
+    for name in home_dir.entries()? {
+        if !name.to_string_lossy().starts_with(LIMA_PREFIX) {
             continue;
         }
+        let path = home.join(&name);
         crate::private_storage::report_migration_result(
-            &entry.path(),
-            &seal_instance_storage(&entry.path()),
+            &path,
+            &home_dir
+                .child(&name)
+                .and_then(|dir| seal_instance_contents(&dir, &path)),
         );
     }
     Ok(())
 }
 
 fn seal_instance_storage(directory: &Path) -> Result<()> {
-    match directory.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-        Ok(_) => crate::fs_util::private_existing_dir(directory)?,
-    }
-    for path in [
-        disk_path_at(directory)?,
-        directory.join("basedisk"),
-        directory.join("ssh.key"),
+    let dir = match PrivateDir::open_existing(directory) {
+        Ok(dir) => dir,
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    seal_instance_contents(&dir, directory)
+}
+
+fn seal_instance_contents(dir: &PrivateDir, directory: &Path) -> Result<()> {
+    for name in [
+        disk_name_at(dir, directory)?,
+        OsStr::new("basedisk"),
+        OsStr::new("ssh.key"),
     ] {
-        match path.symlink_metadata() {
-            Ok(_) => crate::private_storage::private_file(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        match dir.open_regular(name) {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -2069,6 +2226,7 @@ fn limactl_list_output() -> Result<String> {
 mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
+    use std::fs;
 
     #[test]
     fn private_lima_child_creates_private_files_and_directories() {
@@ -2102,6 +2260,7 @@ mod tests {
     fn lima_storage_repairs_disk_modes_and_accepts_only_legacy_disk_alias() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
         let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let directory = root.path().join("coop-test");
         fs::create_dir(&directory).unwrap();
         for name in ["diffdisk", "basedisk", "ssh.key"] {
@@ -2153,6 +2312,8 @@ mod tests {
                 "Stopped",
             ] {
                 let root = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
                 let script = root.path().join("limactl");
                 std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_CALLS\"\ncase \"$1\" in\n list) case \"$COOP_TEST_LIMA_STATE\" in\n nonzero) exit 2;;\n malformed) echo 'bad json';;\n missing_status) echo '{\"name\":\"coop-test\"}';;\n absent) :;;\n *) printf '{\"name\":\"coop-test\",\"status\":\"%s\",\"sshLocalPort\":2222}\\n' \"$COOP_TEST_LIMA_STATE\";;\n esac;;\n stop) exit 0;;\n delete) rm -rf \"$LIMA_HOME/coop-test\";;\nesac\n").unwrap();
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2177,7 +2338,8 @@ mod tests {
                     .unwrap();
                 assert!(
                     output.status.success(),
-                    "{mode}: {}",
+                    "{mode}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
@@ -2188,6 +2350,7 @@ mod tests {
     }
 
     fn run_lima_state_case(root: &Path, mode: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
         let cfg = CoopConfig::default();
         let backend = crate::backend::LimaBackend::new();
         let inst = Instance {
@@ -2201,6 +2364,8 @@ mod tests {
         std::fs::write(&metadata, "metadata sentinel").unwrap();
         let lima_dir = root.join("lima/coop-test");
         std::fs::create_dir_all(&lima_dir).unwrap();
+        std::fs::set_permissions(root.join("lima"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let disk = lima_dir.join("disk");
         std::fs::write(&disk, "disk sentinel").unwrap();
         std::fs::write(lima_dir.join("lima.yaml"), "disk: \"1GiB\"\n").unwrap();
@@ -2340,44 +2505,49 @@ mod tests {
     }
 
     #[test]
-    fn resize_disk_restores_yaml_when_truncate_cannot_spawn() {
-        let Ok(root) = std::env::var("COOP_TEST_TRUNCATE_FAILURE") else {
+    fn resize_disk_rejects_symlink_without_editing_yaml() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(root) = std::env::var("COOP_TEST_LIMA_SYMLINK_DISK") else {
             let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "lima::tests::resize_disk_restores_yaml_when_truncate_cannot_spawn",
+                    "lima::tests::resize_disk_rejects_symlink_without_editing_yaml",
                     "--nocapture",
                 ])
-                .env("COOP_TEST_TRUNCATE_FAILURE", root.path())
+                .env("COOP_TEST_LIMA_SYMLINK_DISK", root.path())
                 .env("LIMA_HOME", root.path())
-                .env("PATH", root.path())
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
             return;
         };
+        let root_path = Path::new(&root);
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"outside").unwrap();
         let inst = Instance {
             name: InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
-            dir: PathBuf::from(&root),
+            dir: root_path.to_path_buf(),
             image: ImageName::new("test.img").unwrap(),
         };
-        let inst_dir = Path::new(&root).join(lima_name(&inst));
+        let inst_dir = root_path.join(lima_name(&inst));
         fs::create_dir_all(&inst_dir).unwrap();
         let yaml_path = inst_dir.join("lima.yaml");
         let original_yaml = "cpus: 2\ndisk: \"1GiB\"\nmemory: \"4GiB\"\n";
         fs::write(&yaml_path, original_yaml).unwrap();
         let disk_path = inst_dir.join("disk");
-        fs::write(&disk_path, b"").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &disk_path).unwrap();
 
         let error = resize_disk(&CoopConfig::default(), &inst, GiB::new(2).unwrap()).unwrap_err();
         assert!(
-            error.to_string().contains("Failed to run truncate"),
+            error.to_string().contains("Unexpected Lima disk alias"),
             "{error:#}"
         );
         assert_eq!(fs::read_to_string(&yaml_path).unwrap(), original_yaml);
-        assert_eq!(fs::metadata(&disk_path).unwrap().len(), 0);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
     }
 
     #[test]
@@ -2695,7 +2865,9 @@ mod tests {
 
     #[test]
     fn start_template_escapes_image_path() {
+        use std::os::unix::fs::PermissionsExt as _;
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let cfg = crate::config::CoopConfig {
             data_dir: crate::config::ConfigPath::new(root.path().join("a\"b\nextra: true")),
             ..crate::config::CoopConfig::default()
@@ -2704,6 +2876,8 @@ mod tests {
         let disk = cfg.lima_base_path(&image);
         std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
         std::fs::write(&disk, "disk").unwrap();
+        crate::fs_util::private_dir(&cfg.data_dir).unwrap();
+        crate::fs_util::private_dir(&cfg.images_dir()).unwrap();
 
         super::generate_start_template(&cfg, &image).unwrap();
         let generated = std::fs::read_to_string(cfg.lima_template_path(&image)).unwrap();
@@ -2713,6 +2887,106 @@ mod tests {
             disk.canonicalize().unwrap().to_str()
         );
         assert_eq!(parsed["mounts"].as_sequence().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn start_template_rejects_symlinked_base_image() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path().join("data")),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("default").unwrap();
+        PrivateDir::create(&cfg.data_dir).unwrap();
+        PrivateDir::create(&cfg.images_dir()).unwrap();
+        PrivateDir::create(&cfg.image_dir(&image)).unwrap();
+        let outside = root.path().join("outside.img");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, cfg.lima_base_path(&image)).unwrap();
+
+        assert!(generate_start_template(&cfg, &image).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(!cfg.lima_template_path(&image).exists());
+    }
+
+    #[test]
+    fn instance_template_reads_held_file_after_name_is_replaced() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let image_dir_path = root.path().join("image");
+        let image_dir = PrivateDir::create(&image_dir_path).unwrap();
+        let template_path = image_dir_path.join("lima-template.yaml");
+        fs::write(&template_path, "mounts: []\n# original\n").unwrap();
+        let mut held = image_dir
+            .open_regular(OsStr::new("lima-template.yaml"))
+            .unwrap();
+        fs::rename(&template_path, image_dir_path.join("old.yaml")).unwrap();
+        let outside = root.path().join("outside.yaml");
+        fs::write(&outside, "mounts: []\n# outside\n").unwrap();
+        symlink(&outside, &template_path).unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        let mounts = [crate::config::Mount {
+            host_path: root.path().into(),
+            guest_path: crate::workspace::default_workspace_path(),
+        }];
+        let generated = instance_template(&inst, &mounts, &mut held, &template_path).unwrap();
+        let content = fs::read_to_string(generated).unwrap();
+        assert!(content.contains("# original"));
+        assert!(!content.contains("# outside"));
+    }
+
+    #[test]
+    fn commit_disk_preserves_sparse_allocation() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let Ok(root) = std::env::var("COOP_TEST_LIMA_SPARSE_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::commit_disk_preserves_sparse_allocation",
+                ])
+                .env("COOP_TEST_LIMA_SPARSE_ROOT", root.path())
+                .env("LIMA_HOME", root.path().join("lima"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let root = Path::new(&root);
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.join("data")),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("default").unwrap();
+        PrivateDir::create(&cfg.data_dir).unwrap();
+        PrivateDir::create(&cfg.images_dir()).unwrap();
+        let lima_home = PrivateDir::create(&root.join("lima")).unwrap();
+        lima_home.create_child(OsStr::new("coop-test")).unwrap();
+        let disk = root.join("lima/coop-test/disk");
+        let source = File::create(&disk).unwrap();
+        source.set_len(64 * 1024 * 1024).unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: image.clone(),
+        };
+        commit_disk(&cfg, &inst, &image).unwrap();
+        let copied = fs::metadata(cfg.lima_base_path(&image)).unwrap();
+        assert_eq!(copied.len(), 64 * 1024 * 1024);
+        assert!(
+            copied.blocks() * 512 < copied.len() / 4,
+            "copy densified sparse disk"
+        );
     }
 
     #[test]
@@ -2749,7 +3023,7 @@ time="..." level=fatal msg="disk too small: 1G < 20G"
         // Write exactly 20 GiB of zeros (sparse file)
         let f = std::fs::File::create(&img).unwrap();
         f.set_len(20 * 1024 * 1024 * 1024).unwrap();
-        let gib = super::base_image_size_gib(&img).unwrap();
+        let gib = super::base_image_size_gib(&f).unwrap();
         assert_eq!(gib.as_u32(), 20);
     }
 
@@ -2760,22 +3034,17 @@ time="..." level=fatal msg="disk too small: 1G < 20G"
         // 20 GiB + 1 byte → should round up to 21
         let f = std::fs::File::create(&img).unwrap();
         f.set_len(20 * 1024 * 1024 * 1024 + 1).unwrap();
-        let gib = super::base_image_size_gib(&img).unwrap();
+        let gib = super::base_image_size_gib(&f).unwrap();
         assert_eq!(gib.as_u32(), 21);
-    }
-
-    #[test]
-    fn base_image_size_gib_missing_file() {
-        assert!(super::base_image_size_gib(Path::new("/nonexistent/base.img")).is_none());
     }
 
     #[test]
     fn base_image_size_gib_zero_length() {
         let dir = tempfile::TempDir::new().unwrap();
         let img = dir.path().join("empty.img");
-        std::fs::File::create(&img).unwrap();
+        let file = std::fs::File::create(&img).unwrap();
         // 0 bytes → GiB::new(0) returns None
-        assert!(super::base_image_size_gib(&img).is_none());
+        assert!(super::base_image_size_gib(&file).is_none());
     }
 
     // ── parse_ssh_config_port ───────────────────────────────────

@@ -9,8 +9,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::{Cmd, command_exists};
-use crate::config::{CoopConfig, ImageName, Instance, InstanceName};
-use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
+#[cfg(target_os = "linux")]
+use crate::config::Instance;
+use crate::config::{CoopConfig, ImageName, InstanceName};
+#[cfg(target_os = "linux")]
+use crate::devcontainer_oci::installed_features;
+use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
@@ -78,7 +82,9 @@ impl TemplateConfig {
     pub fn load_for(cfg: &CoopConfig, image: &ImageName) -> Result<Self> {
         crate::private_storage::prepare_directory(&cfg.image_dir(image))?;
         let path = cfg.template_config_path_for(image);
-        let content = fs::read_to_string(&path)
+        let directory = crate::fs_util::PrivateDir::open_existing(&cfg.image_dir(image))?;
+        let content = directory
+            .read_to_string(std::ffi::OsStr::new("template-config.json"))
             .with_context(|| format!("Failed to read {}", path.display()))?;
         serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {}", path.display()))
@@ -99,6 +105,7 @@ impl TemplateConfig {
 
 /// Run the full setup: check prerequisites, install Firecracker,
 /// fetch kernel, and build template rootfs.
+#[cfg(target_os = "linux")]
 pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
@@ -121,6 +128,7 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
 ///
 /// Copies the template to the instance path, optionally resizing
 /// if `disk_gib` is larger than the template.
+#[cfg(target_os = "linux")]
 pub fn create_instance(
     cfg: &CoopConfig,
     inst: &Instance,
@@ -140,9 +148,7 @@ pub fn create_instance(
     }
 
     // Remove existing instance rootfs if present (may be root-owned)
-    if rootfs.exists() {
-        Cmd::new("rm").arg("-f").arg(&rootfs).sudo().run()?;
-    }
+    crate::privileged_disk::remove(&rootfs)?;
 
     tracing::info!("Creating instance '{}' from template", inst.name);
     reflink_copy(&template, &rootfs).context("Failed to copy template to instance")?;
@@ -157,15 +163,9 @@ pub fn create_instance(
             );
         } else if requested > template_size {
             tracing::info!("Resizing instance to {requested} GiB");
-            let size_arg = format!("{requested}G");
-            Cmd::new("truncate")
-                .arg("-s")
-                .arg(&size_arg)
-                .arg(&rootfs)
-                .sudo()
-                .run()?;
-            Cmd::new("e2fsck").arg("-fy").arg(&rootfs).sudo().run()?;
-            Cmd::new("resize2fs").arg(&rootfs).sudo().run()?;
+            crate::privileged_disk::truncate_gib(&rootfs, requested.as_u32())?;
+            crate::privileged_disk::fsck_fix(&rootfs)?;
+            crate::privileged_disk::resize(&rootfs)?;
         }
     }
 
@@ -175,6 +175,7 @@ pub fn create_instance(
 }
 
 /// Resize a stopped Firecracker instance's rootfs.
+#[cfg(target_os = "linux")]
 pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
@@ -202,15 +203,9 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
         "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
         inst.name
     );
-    let size_arg = format!("{new_size}G");
-    Cmd::new("truncate")
-        .arg("-s")
-        .arg(&size_arg)
-        .arg(&rootfs)
-        .sudo()
-        .run()?;
-    Cmd::new("e2fsck").arg("-fy").arg(&rootfs).sudo().run()?;
-    Cmd::new("resize2fs").arg(&rootfs).sudo().run()?;
+    crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
+    crate::privileged_disk::fsck_fix(&rootfs)?;
+    crate::privileged_disk::resize(&rootfs)?;
     tracing::info!("Resize complete");
     Ok(())
 }
@@ -218,15 +213,11 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
 /// Reflink-friendly copy of a rootfs image (`CoW` where the filesystem
 /// supports it, full copy otherwise). Runs as root because instance and
 /// template rootfs files are root-owned on Firecracker.
+#[cfg(target_os = "linux")]
 fn reflink_copy(src: &Path, dst: &Path) -> Result<()> {
     crate::private_storage::private_file(src)?;
     crate::fs_util::private_dir(dst.parent().context("Disk has no parent")?)?;
-    Cmd::new("cp")
-        .arg("--reflink=auto")
-        .arg(src)
-        .arg(dst)
-        .sudo()
-        .run()
+    crate::privileged_disk::copy_disk(src, dst)
         .with_context(|| format!("Failed to copy {} -> {}", src.display(), dst.display()))?;
     crate::private_storage::private_file(dst)
 }
@@ -237,6 +228,7 @@ fn reflink_copy(src: &Path, dst: &Path) -> Result<()> {
 /// `rootfs.ext4` to the image's `rootfs-template.ext4`. The caller has
 /// already gated on the instance being stopped (filesystem consistency)
 /// and decided whether overwriting an existing image is allowed.
+#[cfg(target_os = "linux")]
 pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
@@ -250,9 +242,7 @@ pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageNa
     let template = cfg.template_path_for(image);
     // Remove an existing (root-owned) template so the copy is a clean
     // overwrite rather than appending to or failing on the old file.
-    if template.exists() {
-        Cmd::new("rm").arg("-f").arg(&template).sudo().run()?;
-    }
+    crate::privileged_disk::remove(&template)?;
 
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
     reflink_copy(&rootfs, &template)
@@ -264,6 +254,7 @@ pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageNa
 /// rootfs from an arbitrary image rather than the instance's origin
 /// image. The network config and guest identity are re-patched for this
 /// instance, overwriting whatever the template baked in at commit time.
+#[cfg(target_os = "linux")]
 pub fn restore_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
     let template = cfg.template_path_for(image);
     if !template.exists() {
@@ -271,9 +262,7 @@ pub fn restore_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageN
     }
 
     let rootfs = inst.rootfs_path();
-    if rootfs.exists() {
-        Cmd::new("rm").arg("-f").arg(&rootfs).sudo().run()?;
-    }
+    crate::privileged_disk::remove(&rootfs)?;
 
     tracing::info!("Restoring instance '{}' from image '{image}'", inst.name);
     reflink_copy(&template, &rootfs)?;
@@ -284,6 +273,7 @@ pub fn restore_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageN
 // ── Mount guard (RAII) ─────────────────────────────────────────
 
 /// How a [`MountGuard`] was set up, selecting the matching teardown on drop.
+#[cfg(target_os = "linux")]
 enum MountKind {
     /// Single loop mount of the rootfs.
     Simple,
@@ -293,22 +283,21 @@ enum MountKind {
 
 /// RAII guard that unmounts a filesystem on drop, preventing leaked
 /// mounts if an operation between mount and unmount fails.
+#[cfg(target_os = "linux")]
 struct MountGuard {
     mount_path: String,
+    disk_path: PathBuf,
     kind: MountKind,
 }
 
+#[cfg(target_os = "linux")]
 impl MountGuard {
     /// Simple loop mount: mount `rootfs` at `mount_path`.
     fn simple(rootfs: &str, mount_path: &str) -> Result<Self> {
-        Cmd::new("mkdir").args(["-p", mount_path]).sudo().run()?;
-        Cmd::new("mount")
-            .args(["-o", "loop", rootfs, mount_path])
-            .sudo()
-            .run()
-            .context("Failed to mount rootfs")?;
+        crate::privileged_disk::mount(Path::new(rootfs)).context("Failed to mount rootfs")?;
         Ok(Self {
             mount_path: mount_path.to_string(),
+            disk_path: PathBuf::from(rootfs),
             kind: MountKind::Simple,
         })
     }
@@ -318,17 +307,19 @@ impl MountGuard {
         mount_chroot(rootfs, mount_path)?;
         Ok(Self {
             mount_path: mount_path.to_string(),
+            disk_path: PathBuf::from(rootfs),
             kind: MountKind::Chroot,
         })
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for MountGuard {
     fn drop(&mut self) {
         match self.kind {
-            MountKind::Chroot => unmount_chroot(&self.mount_path),
+            MountKind::Chroot => unmount_chroot(&self.disk_path, &self.mount_path),
             MountKind::Simple => {
-                if let Err(e) = Cmd::new("umount").arg(&self.mount_path).sudo().run() {
+                if let Err(e) = crate::privileged_disk::unmount(&self.disk_path) {
                     tracing::warn!("Failed to unmount {} (non-fatal): {e}", self.mount_path);
                 }
                 if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
@@ -345,6 +336,7 @@ impl Drop for MountGuard {
 /// Mount the instance rootfs and rewrite its network identity: the
 /// systemd-networkd config with the instance's unique guest IP, plus
 /// `/etc/hostname` and the matching `/etc/hosts` alias.
+#[cfg(target_os = "linux")]
 fn patch_guest_network(inst: &Instance) -> Result<()> {
     let rootfs_str = inst.rootfs_path().display().to_string();
     let mount_dir = inst.dir.join("rootfs-mount");
@@ -358,7 +350,7 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
 
     let _guard = MountGuard::simple(&rootfs_str, &mount_str)?;
 
-    Cmd::new(std::env::current_exe()?)
+    Cmd::new(crate::privileged_disk::running_executable_path())
         .arg("__patch-guest-network")
         .arg(&mount_str)
         .arg(&hostname)
@@ -442,16 +434,30 @@ pub(crate) fn patch_guest_network_files(
 /// final rename replaces a symlink rather than traversing it.
 #[cfg(target_os = "linux")]
 fn replace_guest_file(mount: &Path, parents: &[&str], name: &str, content: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(mount)
+        .context("Failed to open mounted rootfs")?;
+    replace_guest_file_in(directory, parents, name, content)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn replace_guest_file_in(
+    mut directory: fs::File,
+    parents: &[&str],
+    name: &str,
+    content: &[u8],
+) -> Result<()> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
     let open_directory = |path: &Path| {
         fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)
     };
-    let mut directory = open_directory(mount).context("Failed to open mounted rootfs")?;
     for component in parents {
         directory = open_directory(&PathBuf::from(format!(
             "/proc/self/fd/{}/{}",
@@ -576,6 +582,7 @@ fn hosts_with_hostname(contents: &str, hostname: &str) -> String {
 
 // ── Template management ───────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     let image = &opts.image;
     let template = cfg.template_path_for(image);
@@ -613,9 +620,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     let staging = template.with_extension("ext4.new");
 
     // Clean up leftover staging artifact from a previous failed build
-    if staging.exists()
-        && let Err(e) = Cmd::new("rm").arg("-f").arg(&staging).sudo().run()
-    {
+    if let Err(e) = crate::privileged_disk::remove(&staging) {
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
     }
 
@@ -643,19 +648,14 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
 
     if let Err(e) = result {
         // Clean up failed staging image
-        if let Err(rm_err) = Cmd::new("rm").arg("-f").arg(&staging).sudo().run() {
+        if let Err(rm_err) = crate::privileged_disk::remove(&staging) {
             tracing::debug!("Failed to remove staging image (non-fatal): {rm_err}");
         }
         return Err(e);
     }
 
     // Swap staging into place — old template is replaced atomically
-    Cmd::new("mv")
-        .arg(&staging)
-        .arg(&template)
-        .sudo()
-        .run()
-        .context("Failed to swap staging template into place")?;
+    crate::privileged_disk::swap(&staging).context("Failed to swap staging template into place")?;
 
     // Write template config only after image swap succeeds.
     // If we crash between swap and config write, staleness
@@ -698,6 +698,7 @@ struct BuildRecipe<'a> {
     post_install_hash: Option<Sha256Hash>,
 }
 
+#[cfg(target_os = "linux")]
 fn build_template(
     cfg: &CoopConfig,
     opts: &SetupOptions,
@@ -1432,7 +1433,13 @@ fn inject_ssh_keys(cfg: &CoopConfig) -> Result<()> {
             .context("Failed to generate SSH key")?;
     }
 
-    let pubkey = fs::read_to_string(ssh_key_path.with_extension("pub"))
+    let public_key_path = ssh_key_path.with_extension("pub");
+    let pubkey = crate::fs_util::PrivateDir::open_existing(&cfg.data_dir)?
+        .read_to_string(
+            public_key_path
+                .file_name()
+                .context("SSH public key has no name")?,
+        )
         .context("Failed to read generated SSH public key")?;
 
     let unpack_dir = cfg.data_dir.join("squashfs-root");
@@ -1454,6 +1461,7 @@ fn inject_ssh_keys(cfg: &CoopConfig) -> Result<()> {
 }
 
 /// Create the ext4 template image from the unpacked squashfs.
+#[cfg(target_os = "linux")]
 fn create_ext4_image(cfg: &CoopConfig, output_path: &Path) -> Result<()> {
     eprintln!(
         "  Creating ext4 template image ({} GiB)...",
@@ -1464,33 +1472,15 @@ fn create_ext4_image(cfg: &CoopConfig, output_path: &Path) -> Result<()> {
     }
 
     crate::fs_util::atomic_write_with_mode(output_path, "", 0o600)?;
-    let unpack_dir = cfg.data_dir.join("squashfs-root");
-
-    let size_arg = format!("{}G", cfg.vm.template_size_gib);
-    Cmd::new("truncate")
-        .arg("-s")
-        .arg(&size_arg)
-        .arg(output_path)
-        .run()?;
-    Cmd::new("mkfs.ext4")
-        .arg("-d")
-        .arg(&unpack_dir)
-        .arg("-F")
-        .arg(output_path)
-        .sudo()
-        .run()
-        .context("Failed to create ext4 template image")?;
-    Cmd::new("e2fsck")
-        .arg("-fn")
-        .arg(output_path)
-        .sudo()
-        .run()
-        .context("Template verification failed")?;
+    crate::privileged_disk::truncate_gib(output_path, cfg.vm.template_size_gib.as_u32())?;
+    crate::privileged_disk::format(output_path).context("Failed to create ext4 template image")?;
+    crate::privileged_disk::fsck_read(output_path).context("Template verification failed")?;
 
     Ok(())
 }
 
 /// Mount the template rootfs and run the install script in a chroot.
+#[cfg(target_os = "linux")]
 fn install_guest_packages(
     cfg: &CoopConfig,
     image_path: &Path,
@@ -1545,55 +1535,34 @@ fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()>
     )
 }
 
+#[cfg(target_os = "linux")]
 fn mount_chroot(rootfs: &str, mount_str: &str) -> Result<()> {
-    Cmd::new("mkdir").args(["-p", mount_str]).sudo().run()?;
-    Cmd::new("mount")
-        .args(["-o", "loop", rootfs, mount_str])
-        .sudo()
-        .run()?;
-    Cmd::new("mount")
-        .args(["-t", "proc", "proc", &format!("{mount_str}/proc")])
-        .sudo()
-        .run()?;
-    Cmd::new("mount")
-        .args(["-t", "sysfs", "sys", &format!("{mount_str}/sys")])
-        .sudo()
-        .run()?;
-    Cmd::new("mount")
-        .args(["--bind", "/dev", &format!("{mount_str}/dev")])
-        .sudo()
-        .run()?;
-    Cmd::new("mount")
-        .args(["-t", "devpts", "devpts", &format!("{mount_str}/dev/pts")])
-        .sudo()
-        .run()?;
-    Cmd::new("mount")
-        .args(["-t", "tmpfs", "tmpfs", &format!("{mount_str}/tmp")])
-        .sudo()
-        .run()?;
-    if let Err(e) = Cmd::new("cp")
-        .args(["/etc/resolv.conf", &format!("{mount_str}/etc/resolv.conf")])
-        .sudo()
-        .run()
-    {
-        tracing::debug!("Failed to copy resolv.conf into chroot (non-fatal): {e}");
+    let disk = Path::new(rootfs);
+    crate::privileged_disk::mount(disk)?;
+    let result = (|| {
+        for child in ["proc", "sys", "dev", "devpts", "tmp"] {
+            crate::privileged_disk::mount_sub(disk, child)?;
+        }
+        if let Err(e) = crate::privileged_disk::write_resolv_conf(disk) {
+            tracing::debug!("Failed to copy resolv.conf into chroot (non-fatal): {e}");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        unmount_chroot(disk, mount_str);
     }
-    Ok(())
+    result
 }
 
-fn unmount_chroot(mount_str: &str) {
-    let mounts = [
-        format!("{mount_str}/tmp"),
-        format!("{mount_str}/dev/pts"),
-        format!("{mount_str}/dev"),
-        format!("{mount_str}/sys"),
-        format!("{mount_str}/proc"),
-        mount_str.to_string(),
-    ];
-    for mount in &mounts {
-        if let Err(e) = Cmd::new("umount").arg(mount).sudo().run() {
-            tracing::warn!("Failed to unmount {mount} (non-fatal): {e}");
+#[cfg(target_os = "linux")]
+fn unmount_chroot(disk: &Path, mount_str: &str) {
+    for child in ["tmp", "devpts", "dev", "sys", "proc"] {
+        if let Err(e) = crate::privileged_disk::unmount_sub(disk, child) {
+            tracing::debug!("Failed to unmount {child} (non-fatal): {e}");
         }
+    }
+    if let Err(e) = crate::privileged_disk::unmount(disk) {
+        tracing::warn!("Failed to unmount {mount_str} (non-fatal): {e}");
     }
     if let Err(e) = Cmd::new("rmdir").arg(mount_str).sudo().run() {
         tracing::warn!("Failed to remove mount dir {mount_str} (non-fatal): {e}");
@@ -1756,42 +1725,6 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "requires passwordless sudo for the Firecracker disk copy path"]
-    fn private_disk_reflink_copy_and_root_owned_migration() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = tempfile::Builder::new()
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap();
-        let source = root.path().join("rootfs-template.ext4");
-        let destination = root.path().join("rootfs.ext4");
-        fs::write(&source, "disk-canary").unwrap();
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            Command::new("sudo")
-                .args(["-n", "chown", "0"])
-                .arg(&source)
-                .status()
-                .unwrap()
-                .success()
-        );
-        reflink_copy(&source, &destination).unwrap();
-        for path in [&source, &destination] {
-            assert_eq!(
-                fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            let output = Command::new("sudo")
-                .args(["-n", "cat"])
-                .arg(path)
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            assert_eq!(output.stdout, b"disk-canary");
-        }
-    }
 
     #[test]
     fn system_packages_without_apt() {

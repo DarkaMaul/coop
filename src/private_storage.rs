@@ -1,45 +1,46 @@
 //! Permissions for managed host state. Never traverse guest filesystems.
-use std::fs;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
+
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::CoopConfig;
-use crate::fs_util::{private_dir, private_existing_dir};
+#[cfg(test)]
+use crate::fs_util::private_dir;
+use crate::fs_util::{PrivateDir, PrivateEntryType};
 
 /// Seal shared storage roots and migrate existing entries independently.
 /// Invalid instance/image entries do not block operations on unrelated storage.
 pub fn prepare(cfg: &CoopConfig) -> Result<()> {
-    private_dir(&cfg.data_dir)?;
-    repair_files(&cfg.data_dir)?;
-    for (name, policy) in [
-        ("images", MigrationPolicy::Independent),
-        ("instances", MigrationPolicy::Independent),
-        ("state", MigrationPolicy::SharedCredentials),
-    ] {
-        let directory = cfg.data_dir.join(name);
-        private_dir(&directory)?;
-        let result = repair_files(&directory);
-        report_migration_result(&directory, &result);
-        apply_migration_policy(policy, result)?;
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            let result = (|| {
-                let metadata = path.symlink_metadata()?;
-                if metadata.is_dir() {
-                    prepare_directory(&path)?;
-                } else if metadata.is_symlink() {
-                    bail!(
-                        "Managed storage cannot contain a symlink: {}",
-                        path.display()
-                    );
+    let data = PrivateDir::create(&cfg.data_dir)?;
+    repair_files(&data, &cfg.data_dir)?;
+    for root in ManagedRoot::ALL {
+        let directory = cfg.data_dir.join(root.name());
+        let managed = data.create_child(root.name().as_ref())?;
+        let outcome = MigrationOutcome::from_result(repair_files(&managed, &directory));
+        outcome.report(&directory);
+        outcome.apply(root.policy())?;
+        for name in managed.entries()? {
+            let path = directory.join(&name);
+            let outcome = MigrationOutcome::from_result((|| {
+                match managed.entry_type(&name)? {
+                    PrivateEntryType::Directory => repair_files(&managed.child(&name)?, &path)?,
+                    PrivateEntryType::Symlink => {
+                        bail!(
+                            "Managed storage cannot contain a symlink: {}",
+                            path.display()
+                        );
+                    }
+                    PrivateEntryType::Regular | PrivateEntryType::Other => (),
                 }
                 Ok(())
-            })();
-            report_migration_result(&path, &result);
-            apply_migration_policy(policy, result)?;
+            })());
+            outcome.report(&path);
+            outcome.apply(root.policy())?;
         }
     }
     #[cfg(target_os = "macos")]
@@ -50,8 +51,33 @@ pub fn prepare(cfg: &CoopConfig) -> Result<()> {
 /// Validate and repair an existing selected instance, image, or state directory.
 /// Only direct managed files are inspected, never guest filesystems or workspaces.
 pub(crate) fn prepare_directory(directory: &Path) -> Result<()> {
-    private_existing_dir(directory)?;
-    repair_files(directory)
+    repair_files(&PrivateDir::open_existing(directory)?, directory)
+}
+
+#[derive(Clone, Copy)]
+enum ManagedRoot {
+    Images,
+    Instances,
+    State,
+}
+
+impl ManagedRoot {
+    const ALL: [Self; 3] = [Self::Images, Self::Instances, Self::State];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Images => "images",
+            Self::Instances => "instances",
+            Self::State => "state",
+        }
+    }
+
+    fn policy(self) -> MigrationPolicy {
+        match self {
+            Self::Images | Self::Instances => MigrationPolicy::Independent,
+            Self::State => MigrationPolicy::SharedCredentials,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -60,17 +86,46 @@ enum MigrationPolicy {
     SharedCredentials,
 }
 
-fn apply_migration_policy(policy: MigrationPolicy, result: Result<()>) -> Result<()> {
-    match result {
-        Err(error)
-            if matches!(policy, MigrationPolicy::SharedCredentials) && !is_missing(&error) =>
-        {
-            Err(error).context("Shared credential storage failed validation")
+enum MigrationOutcome {
+    Ready,
+    Removed,
+    Rejected(anyhow::Error),
+}
+
+impl MigrationOutcome {
+    fn from_result(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Ready,
+            Err(error) if is_missing(&error) => Self::Removed,
+            Err(error) => Self::Rejected(error),
         }
-        _ => Ok(()),
+    }
+
+    fn report(&self, path: &Path) {
+        if let Self::Rejected(error) = self {
+            tracing::warn!(
+                "Cannot repair managed storage {}: {error:#}",
+                path.display()
+            );
+        }
+    }
+
+    fn apply(self, policy: MigrationPolicy) -> Result<()> {
+        match (policy, self) {
+            (MigrationPolicy::SharedCredentials, Self::Rejected(error)) => {
+                Err(error).context("Shared credential storage failed validation")
+            }
+            _ => Ok(()),
+        }
     }
 }
 
+#[cfg(test)]
+fn apply_migration_policy(policy: MigrationPolicy, result: Result<()>) -> Result<()> {
+    MigrationOutcome::from_result(result).apply(policy)
+}
+
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn report_migration_result(path: &Path, result: &Result<()>) {
     if let Err(error) = result
         && !is_missing(error)
@@ -88,15 +143,51 @@ fn is_missing(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
-fn repair_files(directory: &Path) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".json") || name.ends_with(".txt") || name == "vm_key" || is_disk(&name) {
+#[derive(Debug, PartialEq, Eq)]
+enum FileRepair {
+    UserOwned,
+    RootOwnedDisk,
+}
+
+fn file_repair(owner: u32, user: u32, disk: bool) -> Result<FileRepair> {
+    if owner == user {
+        Ok(FileRepair::UserOwned)
+    } else if owner == 0 && disk {
+        Ok(FileRepair::RootOwnedDisk)
+    } else {
+        bail!("Private storage file is not owned by this user")
+    }
+}
+
+#[cfg_attr(
+    target_os = "macos",
+    expect(unused_variables, reason = "path is used by the Linux disk helper")
+)]
+fn repair_files(directory: &PrivateDir, path: &Path) -> Result<()> {
+    for name in directory.entries()? {
+        let display = name.to_string_lossy();
+        if display.ends_with(".json")
+            || display.ends_with(".txt")
+            || display == "vm_key"
+            || is_disk(&display)
+        {
             let result = (|| {
-                if !entry.path().symlink_metadata()?.is_dir() {
-                    private_file(&entry.path())?;
+                if directory.entry_type(&name)? != PrivateEntryType::Directory {
+                    let stat = directory.entry_stat(&name)?;
+                    // SAFETY: geteuid has no preconditions.
+                    match file_repair(stat.st_uid, unsafe { libc::geteuid() }, is_disk(&display))? {
+                        FileRepair::UserOwned => {
+                            directory.open_regular(&name)?;
+                        }
+                        FileRepair::RootOwnedDisk => {
+                            // The privileged side independently opens and validates
+                            // the disk before changing it through its descriptor.
+                            #[cfg(target_os = "linux")]
+                            crate::privileged_disk::seal_existing(&path.join(&name))?;
+                            #[cfg(target_os = "macos")]
+                            bail!("Root-owned managed disk is unsupported on macOS");
+                        }
+                    }
                 }
                 Ok(())
             })();
@@ -124,56 +215,38 @@ fn is_disk(name: &str) -> bool {
 
 /// Seal an existing sensitive file. Root-owned Firecracker disks are repaired
 /// with sudo only when necessary, after sealing their user-owned parent.
+#[cfg_attr(
+    all(target_os = "macos", not(test)),
+    expect(dead_code, reason = "Linux-only caller")
+)]
 pub fn private_file(path: &Path) -> Result<()> {
-    private_existing_dir(path.parent().context("Private file has no parent")?)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        bail!(
-            "Private storage requires a regular file with one link: {}",
-            path.display()
-        );
-    }
+    let directory =
+        PrivateDir::open_existing(path.parent().context("Private file has no parent")?)?;
+    let name = path.file_name().context("Private file has no name")?;
+    let stat = directory.entry_stat(name)?;
     // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    if metadata.uid() != uid {
-        if metadata.uid() != 0
-            || !is_disk(
-                &path
-                    .file_name()
-                    .context("Private file has no name")?
-                    .to_string_lossy(),
-            )
-        {
-            bail!(
-                "Private storage file is not owned by this user: {}",
-                path.display()
-            );
-        }
-        if metadata.mode() & 0o777 != 0o600 {
-            tracing::warn!("Restricting existing disk permissions: {}", path.display());
-            crate::cmd::Cmd::new("chmod")
-                .arg("0600")
-                .arg("--")
-                .arg(path)
-                .sudo()
-                .run()?;
-        }
-        return Ok(());
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let opened = file.metadata()?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        bail!(
-            "Private storage file changed while opening: {}",
+    match file_repair(
+        stat.st_uid,
+        unsafe { libc::geteuid() },
+        is_disk(&name.to_string_lossy()),
+    )
+    .with_context(|| {
+        format!(
+            "Private storage file is not owned by this user: {}",
             path.display()
-        );
+        )
+    })? {
+        FileRepair::UserOwned => {
+            directory.open_regular(name)?;
+            Ok(())
+        }
+        FileRepair::RootOwnedDisk => {
+            #[cfg(target_os = "linux")]
+            return crate::privileged_disk::seal_existing(path);
+            #[cfg(target_os = "macos")]
+            bail!("Root-owned managed disk is unsupported on macOS");
+        }
     }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    crate::fs_util::clear_private_acl(&file)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -598,6 +671,25 @@ mod tests {
         for name in ["state.json", "file", "disk.log", "rootfs.EXT4", "image.IMG"] {
             assert!(!is_disk(name));
         }
+    }
+
+    #[test]
+    fn file_repair_classifies_owned_files_and_root_disks() {
+        assert_eq!(
+            file_repair(1000, 1000, false).unwrap(),
+            FileRepair::UserOwned
+        );
+        assert_eq!(
+            file_repair(1000, 1000, true).unwrap(),
+            FileRepair::UserOwned
+        );
+        assert_eq!(file_repair(0, 0, false).unwrap(), FileRepair::UserOwned);
+        assert_eq!(
+            file_repair(0, 1000, true).unwrap(),
+            FileRepair::RootOwnedDisk
+        );
+        assert!(file_repair(0, 1000, false).is_err());
+        assert!(file_repair(1001, 1000, true).is_err());
     }
 
     #[cfg(target_os = "linux")]

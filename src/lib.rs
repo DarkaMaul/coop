@@ -27,6 +27,8 @@ mod pat_prompt;
 mod paths;
 mod port_forward;
 mod private_storage;
+#[cfg(target_os = "linux")]
+mod privileged_disk;
 mod proxy;
 mod proxy_state;
 mod remote_command;
@@ -102,6 +104,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal descriptor-bound operations on Firecracker disk images.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__disk-op", hide = true)]
+    DiskOp {
+        operation: String,
+        root: PathBuf,
+        path: PathBuf,
+        argument: Option<String>,
+    },
     /// Internal privileged helper for a mounted Firecracker rootfs.
     #[cfg(target_os = "linux")]
     #[command(name = "__patch-guest-network", hide = true)]
@@ -1023,6 +1034,17 @@ pub fn run() -> Result<()> {
     init_tracing(cli.verbose);
 
     #[cfg(target_os = "linux")]
+    if let Commands::DiskOp {
+        ref operation,
+        ref root,
+        ref path,
+        ref argument,
+    } = cli.command
+    {
+        return privileged_disk::run(operation, root, path, argument.as_deref());
+    }
+
+    #[cfg(target_os = "linux")]
     if let Commands::PatchGuestNetwork {
         ref mount,
         ref hostname,
@@ -1105,6 +1127,8 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Commands::DiskOp { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::PatchGuestNetwork { .. } => unreachable!("handled before config loading"),
         Commands::Up {

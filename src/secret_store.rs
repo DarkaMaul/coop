@@ -11,7 +11,6 @@
 //! available so the wizard always has at least one storage choice.
 
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -272,11 +271,8 @@ pub fn delete_secret(
         Backend::File => {
             let dir = state_dir.join(secret_subdir(service));
             let path = file_backend_path(&dir, account);
-            if path.exists() {
-                fs::remove_file(&path)
-                    .with_context(|| format!("Failed to remove {}", path.display()))?;
-            }
-            Ok(())
+            crate::fs_util::remove_private_if_exists(&path)
+                .with_context(|| format!("Failed to remove {}", path.display()))
         }
     }
 }
@@ -566,14 +562,17 @@ fn store_file(
     state_dir: &Path,
 ) -> Result<CmdToken> {
     let dir = state_dir.join(secret_subdir(service));
-    crate::fs_util::private_dir(&dir)?;
-    let path = file_backend_path(&dir, account);
+    let directory = crate::fs_util::PrivateDir::create(&dir)?;
     let content = if token.ends_with('\n') {
         token.to_string()
     } else {
         format!("{token}\n")
     };
-    crate::fs_util::atomic_write_with_mode(&path, &content, 0o600)?;
+    directory.write_atomic_private(
+        std::ffi::OsStr::new(&format!("{account}.txt")),
+        content.as_bytes(),
+        0o600,
+    )?;
     Ok(CmdToken::File {
         dir,
         account: account.clone(),

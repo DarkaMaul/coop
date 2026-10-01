@@ -1,10 +1,13 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::io::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -14,12 +17,390 @@ use anyhow::{Context, Result, bail};
 /// must have the sticky bit (for example /tmp). Existing private directories
 /// are tightened through their open descriptor before being used.
 pub fn private_dir(path: &Path) -> Result<()> {
-    seal_private_dir(path, MissingDirectory::Create)
+    PrivateDir::create(path).map(|_| ())
 }
 
 /// Seal existing private storage without recreating a concurrently removed path.
+#[cfg(test)]
 pub fn private_existing_dir(path: &Path) -> Result<()> {
-    seal_private_dir(path, MissingDirectory::Reject)
+    PrivateDir::open_existing(path).map(|_| ())
+}
+
+/// Remove a managed file or invalid symlink through its checked parent.
+/// Concurrent removal of the parent or child is an ordinary no-op.
+pub(crate) fn remove_private_if_exists(path: &Path) -> Result<()> {
+    let parent = path.parent().context("Private file has no parent")?;
+    let directory = match PrivateDir::open_existing(parent) {
+        Ok(directory) => directory,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let name = path.file_name().context("Private file has no name")?;
+    match directory.unlink_non_directory(name) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Read an optional managed state file through its checked parent descriptor.
+pub(crate) fn read_optional_private(path: &Path) -> Result<Option<String>> {
+    let parent = path.parent().context("Private file has no parent")?;
+    let name = path.file_name().context("Private file has no name")?;
+    let read = (|| PrivateDir::open_existing(parent)?.read_to_string(name))();
+    match read {
+        Ok(content) => Ok(Some(content)),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A checked private directory whose descriptor pins the directory used by
+/// subsequent child operations. Names passed to its methods are one component.
+pub struct PrivateDir {
+    file: File,
+}
+
+impl PrivateDir {
+    pub fn create(path: &Path) -> Result<Self> {
+        seal_private_dir(path, MissingDirectory::Create)
+    }
+
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        seal_private_dir(path, MissingDirectory::Reject)
+    }
+
+    pub fn create_child(&self, name: &OsStr) -> Result<Self> {
+        self.open_child(name, MissingDirectory::Create)
+    }
+
+    pub fn child(&self, name: &OsStr) -> Result<Self> {
+        self.open_child(name, MissingDirectory::Reject)
+    }
+
+    fn open_child(&self, name: &OsStr, missing: MissingDirectory) -> Result<Self> {
+        let name = child_name(name)?;
+        let file = match open_directory_at(&self.file, &name, SymlinkPolicy::Reject) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && matches!(missing, MissingDirectory::Create) =>
+            {
+                create_private_directory_at(&self.file, &name)?;
+                open_directory_at(&self.file, &name, SymlinkPolicy::Reject)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        check_private_directory(&file)?;
+        Ok(Self { file })
+    }
+
+    /// Open, validate, and seal a user-owned regular file through this directory.
+    pub fn open_regular(&self, name: &OsStr) -> Result<File> {
+        let file = self.open_checked_regular(name, libc::O_RDONLY)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        clear_private_acl(&file)?;
+        Ok(file)
+    }
+
+    pub fn open_regular_with_mode(&self, name: &OsStr, maximum_mode: u32) -> Result<File> {
+        let file = self.open_checked_regular(name, libc::O_RDONLY)?;
+        let existing = file.metadata()?.mode() & 0o777;
+        file.set_permissions(fs::Permissions::from_mode(existing & maximum_mode))?;
+        clear_private_acl(&file)?;
+        Ok(file)
+    }
+
+    pub fn open_regular_for_update(&self, name: &OsStr) -> Result<File> {
+        let checked = self.open_regular(name)?;
+        let writable = self.open_checked_regular(name, libc::O_RDWR)?;
+        let original = checked.metadata()?;
+        let reopened = writable.metadata()?;
+        if original.dev() != reopened.dev() || original.ino() != reopened.ino() {
+            bail!("Private file changed while opening for update");
+        }
+        Ok(writable)
+    }
+
+    fn open_checked_regular(&self, name: &OsStr, access: libc::c_int) -> Result<File> {
+        let name = child_name(name)?;
+        let file = open_file_at(
+            &self.file,
+            &name,
+            access | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )?;
+        check_user_regular(&file)?;
+        Ok(file)
+    }
+
+    pub fn read_to_string(&self, name: &OsStr) -> Result<String> {
+        let mut contents = String::new();
+        self.open_regular(name)?.read_to_string(&mut contents)?;
+        Ok(contents)
+    }
+
+    /// Open or create a stable lock inode without truncating it.
+    pub fn open_or_create_lock(&self, name: &OsStr) -> Result<File> {
+        let name = child_name(name)?;
+        let file = open_file_at(
+            &self.file,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )?;
+        check_user_regular(&file)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        clear_private_acl(&file)?;
+        Ok(file)
+    }
+
+    /// Remove a regular child from the pinned directory. This assumes the
+    /// private namespace remains under the caller's control between checks.
+    pub fn remove_child(&self, name: &OsStr) -> Result<()> {
+        self.open_regular(name)?;
+        unlink_child_at(&self.file, &child_name(name)?)?;
+        Ok(())
+    }
+
+    /// Unlink an entry without following it. This also permits removing a
+    /// rejected symlink so managed state can recover from an invalid entry.
+    pub fn unlink_non_directory(&self, name: &OsStr) -> Result<()> {
+        if self.entry_type(name)? == PrivateEntryType::Directory {
+            bail!("Cannot unlink a private directory through a file operation");
+        }
+        unlink_child_at(&self.file, &child_name(name)?)?;
+        Ok(())
+    }
+
+    /// Rename a regular child within the pinned private directory.
+    pub fn rename_child(&self, source: &OsStr, target: &OsStr) -> Result<()> {
+        self.open_regular(source)?;
+        if let Err(error) = self.open_regular(target)
+            && error
+                .downcast_ref::<std::io::Error>()
+                .is_none_or(|io| io.kind() != std::io::ErrorKind::NotFound)
+        {
+            return Err(error);
+        }
+        rename_child_at(&self.file, &child_name(source)?, &child_name(target)?)?;
+        Ok(())
+    }
+
+    /// Atomically replace a name in this private directory. This relies on
+    /// exclusive control of the directory namespace: renameat cannot compare
+    /// the destination inode with the one inspected for permissions.
+    pub fn write_atomic_private(&self, name: &OsStr, content: &[u8], mode: u32) -> Result<()> {
+        let mut source = content;
+        self.atomic_with_writer(name, mode, |temporary| {
+            std::io::copy(&mut source, temporary)?;
+            Ok(())
+        })
+    }
+
+    /// Copy an opened disk while retaining large holes in sparse images.
+    pub fn copy_atomic_sparse(&self, name: &OsStr, source: &File, mode: u32) -> Result<()> {
+        self.atomic_with_writer(name, mode, |temporary| copy_sparse_file(source, temporary))
+    }
+
+    fn atomic_with_writer(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        write: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<()> {
+        let target = child_name(name)?;
+        let mode = match self.open_checked_regular(name, libc::O_RDONLY) {
+            Ok(file) => file.metadata()?.mode() & mode,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                mode
+            }
+            Err(error) => return Err(error),
+        };
+        let (temp_name, mut temp_file) = self.create_temporary()?;
+        let result = (|| {
+            clear_private_acl(&temp_file)?;
+            write(&mut temp_file)?;
+            temp_file.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+            rename_child_at(&self.file, &temp_name, &target)?;
+            Ok(())
+        })();
+        let _ = unlink_child_at(&self.file, &temp_name);
+        result
+    }
+
+    fn create_temporary(&self) -> Result<(CString, File)> {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..16 {
+            let index = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let name = CString::new(format!(".coop-{}-{index}.tmp", std::process::id()))?;
+            match open_file_at(
+                &self.file,
+                &name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            ) {
+                Ok(file) => return Ok((name, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("Cannot allocate a private temporary file")
+    }
+
+    pub fn entry_type(&self, name: &OsStr) -> Result<PrivateEntryType> {
+        let stat = stat_child_at(&self.file, &child_name(name)?)?;
+        Ok(match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => PrivateEntryType::Directory,
+            libc::S_IFREG => PrivateEntryType::Regular,
+            libc::S_IFLNK => PrivateEntryType::Symlink,
+            _ => PrivateEntryType::Other,
+        })
+    }
+
+    pub(crate) fn entry_stat(&self, name: &OsStr) -> Result<libc::stat> {
+        Ok(stat_child_at(&self.file, &child_name(name)?)?)
+    }
+
+    pub fn entries(&self) -> Result<Vec<OsString>> {
+        // Opening "." creates an independent directory offset; dup/try_clone
+        // would share the offset with other enumerations of this handle.
+        let cloned = open_directory_at(&self.file, c".", SymlinkPolicy::Reject)?;
+        // SAFETY: fdopendir takes ownership of a valid duplicated descriptor.
+        let directory = unsafe { libc::fdopendir(cloned.as_raw_fd()) };
+        if directory.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let _ = cloned.into_raw_fd();
+        let directory = DirectoryStream(directory);
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: errno is thread local and this platform function returns
+            // its writable address. Clearing it distinguishes EOF from error.
+            unsafe { *errno_location() = 0 };
+            // SAFETY: directory owns a live DIR stream; returned entry remains
+            // valid until the next readdir call.
+            let entry = unsafe { libc::readdir(directory.0) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(0) {
+                    break;
+                }
+                return Err(error.into());
+            }
+            // SAFETY: d_name is a NUL-terminated string inside the live entry.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(OsString::from_vec(name.to_bytes().to_vec()));
+            }
+        }
+        Ok(names)
+    }
+
+    pub fn read_link(&self, name: &OsStr) -> Result<std::path::PathBuf> {
+        let name = child_name(name)?;
+        if self.entry_type(OsStr::from_bytes(name.as_bytes()))? != PrivateEntryType::Symlink {
+            bail!("Private child is not a symlink");
+        }
+        let mut buffer = vec![0; 256];
+        loop {
+            // SAFETY: the directory descriptor and NUL-terminated name are valid;
+            // buffer is writable for exactly its reported length.
+            let count = unsafe {
+                libc::readlinkat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if count.cast_unsigned() < buffer.len() {
+                buffer.truncate(count.cast_unsigned());
+                return Ok(OsString::from_vec(buffer).into());
+            }
+            buffer.resize(buffer.len() * 2, 0);
+        }
+    }
+}
+
+/// Copy file data through pinned descriptors. Entirely zero chunks become
+/// holes even on filesystems that cannot report `SEEK_DATA`/`SEEK_HOLE`. This is
+/// a bounded-memory fallback for raw VM images when reflinks are unavailable.
+pub(crate) fn copy_sparse_file(source: &File, target: &File) -> Result<()> {
+    let length = source.metadata()?.len();
+    target.set_len(0)?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    while offset < length {
+        let remaining = usize::try_from((length - offset).min(buffer.len() as u64))?;
+        source.read_exact_at(&mut buffer[..remaining], offset)?;
+        if buffer[..remaining].iter().any(|byte| *byte != 0) {
+            target.write_all_at(&buffer[..remaining], offset)?;
+        }
+        offset += remaining as u64;
+    }
+    target.set_len(length)?;
+    Ok(())
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: fdopendir returned this owned DIR stream.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns a valid thread-local errno address.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns a valid thread-local errno address.
+    unsafe { libc::__error() }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateEntryType {
+    Directory,
+    Regular,
+    Symlink,
+    Other,
+}
+
+fn child_name(name: &OsStr) -> Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        bail!("Private child name must be one component");
+    }
+    Ok(CString::new(bytes)?)
 }
 
 #[derive(Clone, Copy)]
@@ -28,7 +409,7 @@ enum MissingDirectory {
     Reject,
 }
 
-fn seal_private_dir(path: &Path, missing: MissingDirectory) -> Result<()> {
+fn seal_private_dir(path: &Path, missing: MissingDirectory) -> Result<PrivateDir> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Component;
@@ -94,6 +475,26 @@ fn seal_private_dir(path: &Path, missing: MissingDirectory) -> Result<()> {
             check_ancestor(&directory)?;
         }
     }
+    Ok(PrivateDir { file: directory })
+}
+
+fn check_private_directory(file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("Private storage requires an owned directory");
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o700))?;
+    clear_private_acl(file)
+}
+
+fn check_user_regular(file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        bail!("Private storage requires an owned regular file with one link");
+    }
     Ok(())
 }
 
@@ -123,6 +524,65 @@ fn open_directory_at(parent: &File, name: &CStr, policy: SymlinkPolicy) -> std::
     }
     // SAFETY: openat returned a new owned descriptor, including a valid fd 0.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_file_at(parent: &File, name: &CStr, flags: libc::c_int) -> std::io::Result<File> {
+    // SAFETY: parent owns a live descriptor and name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor, including fd 0.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn stat_child_at(parent: &File, name: &CStr) -> std::io::Result<libc::stat> {
+    // SAFETY: all-zero is a valid initial value for the stat output structure.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: parent and name are valid; stat is writable.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &raw mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
+fn rename_child_at(parent: &File, source: &CStr, target: &CStr) -> std::io::Result<()> {
+    // SAFETY: both names are NUL-terminated and parent owns its descriptor.
+    if unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unlink_child_at(parent: &File, name: &CStr) -> std::io::Result<()> {
+    // SAFETY: name is NUL-terminated and parent owns its descriptor.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn root_owned_symlink_at(parent: &File, name: &CStr) -> bool {
@@ -210,6 +670,7 @@ fn acl_removal_error(error: std::io::Error) -> Result<()> {
 mod mac_acl {
     use std::fs::File;
     use std::os::unix::io::AsRawFd as _;
+    use std::ptr::NonNull;
 
     use anyhow::{Result, bail};
 
@@ -233,24 +694,34 @@ mod mac_acl {
         fn acl_get_flag_np(flags: *mut libc::c_void, flag: libc::c_int) -> libc::c_int;
     }
 
-    struct Acl(*mut libc::c_void);
+    struct Acl(NonNull<libc::c_void>);
+
+    impl Acl {
+        fn from_raw(pointer: *mut libc::c_void) -> Result<Self> {
+            NonNull::new(pointer)
+                .map(Self)
+                .ok_or_else(|| std::io::Error::last_os_error().into())
+        }
+
+        fn as_ptr(&self) -> *mut libc::c_void {
+            self.0.as_ptr()
+        }
+    }
+
     impl Drop for Acl {
         fn drop(&mut self) {
             // SAFETY: this owns the allocation from acl_init or acl_get_fd.
             unsafe {
-                acl_free(self.0);
+                acl_free(self.as_ptr());
             }
         }
     }
 
     pub(super) fn clear(file: &File) -> Result<()> {
         // SAFETY: acl_init allocates an empty extended ACL.
-        let acl = Acl(unsafe { acl_init(0) });
-        if acl.0.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        let acl = Acl::from_raw(unsafe { acl_init(0) })?;
         // SAFETY: valid descriptor and allocated ACL.
-        if unsafe { acl_set_fd(file.as_raw_fd(), acl.0) } != 0 {
+        if unsafe { acl_set_fd(file.as_raw_fd(), acl.as_ptr()) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ENOTSUP) {
                 return Err(error.into());
@@ -269,12 +740,14 @@ mod mac_acl {
             }
             return Err(error.into());
         }
-        let acl = Acl(pointer);
+        let acl = Acl::from_raw(pointer)?;
         let mut id = 0; // ACL_FIRST_ENTRY; ACL_NEXT_ENTRY is -1.
         loop {
             let mut entry = std::ptr::null_mut();
             // SAFETY: acl is allocated; entry is a writable output pointer.
-            if unsafe { acl_get_entry(acl.0, id, &raw mut entry) } != 0 {
+            // Darwin acl_get_entry returns 0 for an entry and -1 with EINVAL
+            // after the final entry (Apple acl_get_entry(3) RETURN VALUES).
+            if unsafe { acl_get_entry(acl.as_ptr(), id, &raw mut entry) } != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::EINVAL) {
                     return Ok(());
@@ -310,8 +783,12 @@ mod mac_acl {
 
 /// Write private JSON state atomically, tightening existing permissions.
 pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
-    private_dir(path.parent().context("Private state has no parent")?)?;
-    atomic_write_with_mode(path, json, 0o600)
+    let directory = PrivateDir::create(path.parent().context("Private state has no parent")?)?;
+    directory.write_atomic_private(
+        path.file_name().context("Private state has no file name")?,
+        json.as_bytes(),
+        0o600,
+    )
 }
 
 /// RAII file lock acquired via `flock(LOCK_EX)`. Releases on drop.
@@ -442,6 +919,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_copy_preserves_contents_and_holes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(root.path().join("source"))
+            .unwrap();
+        let target_path = root.path().join("target");
+        let target = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&target_path)
+            .unwrap();
+        let length = 64 * 1024 * 1024 + 3;
+        source.set_len(length).unwrap();
+        source.write_at(b"begin", 0).unwrap();
+        source.write_at(b"end", length - 3).unwrap();
+        target.set_len(128 * 1024 * 1024).unwrap();
+
+        copy_sparse_file(&source, &target).unwrap();
+
+        assert_eq!(target.metadata().unwrap().len(), length);
+        let mut beginning = [0; 5];
+        let mut middle = [1; 5];
+        let mut end = [0; 3];
+        target.read_at(&mut beginning, 0).unwrap();
+        target.read_at(&mut middle, 32 * 1024 * 1024).unwrap();
+        target.read_at(&mut end, length - 3).unwrap();
+        assert_eq!(&beginning, b"begin");
+        assert_eq!(&middle, &[0; 5]);
+        assert_eq!(&end, b"end");
+        assert!(target.metadata().unwrap().blocks() * 512 < 1024 * 1024);
+    }
+
+    #[test]
     fn directory_creation_preserves_existing_and_failed_results() {
         assert_eq!(
             directory_creation(0, std::io::Error::from_raw_os_error(libc::EACCES)).unwrap(),
@@ -524,6 +1040,66 @@ mod tests {
             }
         });
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 32);
+    }
+
+    #[test]
+    fn private_directory_enumeration_is_repeatable() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let directory = PrivateDir::create(&root.path().join("managed")).unwrap();
+        directory
+            .write_atomic_private(OsStr::new("one.json"), b"{}", 0o600)
+            .unwrap();
+        directory
+            .write_atomic_private(OsStr::new("two.json"), b"{}", 0o600)
+            .unwrap();
+        let first = directory.entries().unwrap();
+        let second = directory.entries().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn private_handle_keeps_writes_in_validated_directory_after_name_replacement() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let original = root.path().join("managed");
+        let directory = PrivateDir::create(&original).unwrap();
+        let moved = root.path().join("moved");
+        fs::rename(&original, &moved).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &original).unwrap();
+        directory
+            .write_atomic_private(OsStr::new("state.json"), b"checked", 0o600)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(moved.join("state.json")).unwrap(),
+            "checked"
+        );
+        assert!(!outside.join("state.json").exists());
+    }
+
+    #[test]
+    fn open_for_update_repairs_read_only_private_file() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let directory = PrivateDir::create(root.path()).unwrap();
+        let path = root.path().join("disk");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let mut file = directory
+            .open_regular_for_update(OsStr::new("disk"))
+            .unwrap();
+        file.write_all(b"more").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"more");
     }
 
     #[test]
@@ -672,7 +1248,10 @@ mod tests {
 
     #[test]
     fn atomic_write_json_creates_parent_dirs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("sub").join("dir").join("test.json");
         atomic_write_json(&path, "{}").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");

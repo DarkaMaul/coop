@@ -147,7 +147,17 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   Lima’s same-directory `disk` → `diffdisk` alias is permitted. macOS ancestor
   ACLs must not grant write/control access. Extended ACLs are cleared on private directories and user-owned files.
   Root-owned Firecracker disks are chmodded with sudo when needed; their Unix
-  ACL mask is restricted by `0600`. Lima uses a private child umask, reseals disks after startup, and protects
+  ACL mask is restricted by `0600`. Managed storage operations pin checked
+  directories and open child files relative to those descriptors. The Linux
+  privileged disk helper repeats managed-path validation after sudo, uses the
+  opened disk for filesystem tools and loop setup, and serializes copies through
+  a private lock. Sudo runs the current executable through the parent's procfs
+  executable link, which pins its inode even if its install pathname changes.
+  Privileged unmounts use the kernel's no-follow flag on guest mountpoint names.
+  Atomic replacement assumes the trusted host user does not
+  concurrently replace names inside the private directory. `limactl` accepts
+  paths rather than inherited descriptors, so its own path resolution remains
+  within the trusted host-tool boundary. Lima uses a private child umask, reseals disks after startup, and protects
   its coop directories separately from `data_dir`. See
   [private host storage](configuration.md#private-host-storage). A host
   `~/.grok/auth.json` copied into the guest is `chmod 0600` after `scp`
