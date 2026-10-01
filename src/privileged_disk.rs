@@ -28,10 +28,10 @@ enum DiskKind {
     Instance,
 }
 
-const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4c82;
-const LOOP_SET_FD: libc::c_ulong = 0x4c00;
-const LOOP_CLR_FD: libc::c_ulong = 0x4c01;
-const LOOP_SET_STATUS64: libc::c_ulong = 0x4c04;
+const LOOP_CTL_GET_FREE: libc::Ioctl = libc::_IO(0x4c, 0x82);
+const LOOP_SET_FD: libc::Ioctl = libc::_IO(0x4c, 0x00);
+const LOOP_CLR_FD: libc::Ioctl = libc::_IO(0x4c, 0x01);
+const LOOP_SET_STATUS64: libc::Ioctl = libc::_IO(0x4c, 0x04);
 
 fn invoking_uid() -> Result<u32> {
     // A direct invocation is useful for rootless tests. Under sudo the real

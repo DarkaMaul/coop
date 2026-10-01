@@ -731,6 +731,10 @@ mod mac_acl {
     }
 
     pub(super) fn check_ancestor(file: &File) -> Result<()> {
+        // ADD_FILE, DELETE, ADD_SUBDIRECTORY, DELETE_CHILD, WRITE_SECURITY, CHANGE_OWNER.
+        const WRITE_CONTROL: u64 =
+            (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13);
+
         // SAFETY: file owns a valid descriptor.
         let pointer = unsafe { acl_get_fd(file.as_raw_fd()) };
         if pointer.is_null() {
@@ -771,9 +775,6 @@ mod mac_acl {
             if inherit_only < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            // ADD_FILE, DELETE, ADD_SUBDIRECTORY, DELETE_CHILD, WRITE_SECURITY, CHANGE_OWNER.
-            const WRITE_CONTROL: u64 =
-                (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13);
             if tag == 1 && inherit_only == 0 && mask & WRITE_CONTROL != 0 {
                 bail!("Private storage ancestor has an ACL granting write access");
             }
