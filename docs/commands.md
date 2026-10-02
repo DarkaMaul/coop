@@ -587,7 +587,7 @@ coop push [NAME] [FLAGS]
 | `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 Without `--force`, push refuses to transfer if the guest Git status check fails
-or reports changes. Pull does the same for a failing or dirty local Git status.
+or reports changes.
 
 ```
 coop push
@@ -597,7 +597,10 @@ coop push my-project --dir ./src --force
 ### `pull`
 
 Copy the VM's `/workspace` to a local directory. Defaults to the host path
-recorded when the instance was created with `coop up`.
+recorded when the instance was created with `coop up`. Pulled files are
+controlled by the untrusted guest and may be malicious. Review them before
+executing them or interpreting them with Git, editors, build tools, shells, or
+other host applications.
 
 ```
 coop pull [NAME] [FLAGS]
@@ -607,13 +610,18 @@ coop pull [NAME] [FLAGS]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--dir <dir>` | Local directory to pull into (defaults to the workspace host path) |
-| `--force` | Overwrite local changes without confirmation |
-| `--exclude-git` | Skip the `.git/` directory in this transfer |
+| `--force` | Allow a nonempty destination and overwrite matching files; does not make pulled content trusted |
 
 ```
-coop pull
-coop pull my-project --dir ./local-copy --force
+coop pull --dir ./local-copy
+coop pull my-project --dir ./other-review-copy
 ```
+
+Without `--force`, pull accepts only a missing or empty destination. coop does
+not run host Git to decide whether an existing destination is clean. The
+best-effort `.git` filters are not a guarantee that the result contains no Git
+administration aliases, and pull does not sanitize repositories created by an
+older vulnerable release.
 
 ### `editor`
 

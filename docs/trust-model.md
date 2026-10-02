@@ -55,6 +55,16 @@ user launched it.
   channel** and the primary place a path-traversal or symlink escape could land.
   Files retain their untrusted origin after transfer, including when a host tool
   discovers them implicitly or consumes them during a later operation.
+  Pull never invokes host Git to inspect its destination. It refuses a nonempty
+  destination unless the user supplies `--force`, which authorizes overwriting
+  matching files but does not change their trust level. The transports attempt
+  to omit common ASCII-case `.git` paths, and both pull transports write into
+  an empty staging directory before a trusted host-side filtered installation.
+  Those filters are
+  defense-in-depth, not a guarantee across every transport, Git, and filesystem
+  naming behavior. Treat every pulled file and the resulting directory as
+  potentially malicious. In particular, coop does not make a repository
+  previously pulled by a vulnerable release safe for host Git or other tools.
 - **Rootfs files touched while loop-mounted during setup.** `setup.rs`
   `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
   commit` turns a guest-mutated rootfs into an image template — so the guest

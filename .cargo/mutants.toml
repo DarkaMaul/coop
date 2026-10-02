@@ -114,6 +114,10 @@ exclude_re = [
   "\\btar_pipe_transfer\\b",
   "\\btar_pipe_transfer_to\\b",
   "\\btar_pipe_pull\\b",
+  "\\btar_pipe_pull_staged\\b",
+  # Shells out to rsync; install_staged_pull_args remains in scope and pins the
+  # security-relevant source, destination, and Git-metadata exclusion.
+  "\\binstall_staged_pull\\b",
   "\\bjoin_drainer\\b",
   "\\bsync_mounts\\b",
   "\\bsync_mount_contents\\b",
@@ -122,7 +126,6 @@ exclude_re = [
   "\\brsync_push\\b",
   "\\brsync_pull\\b",
   "\\bcheck_guest_dirty\\b",
-  "\\bcheck_local_dirty\\b",
   "\\batomic_write\\b",
   "\\bwrite_ssh_config\\b",
   "\\brefresh_ssh_config_if_present\\b",

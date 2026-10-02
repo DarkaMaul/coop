@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Security
+
+- Stop invoking host Git during `coop pull`. Pull now refuses a nonempty
+  destination unless `--force` explicitly authorizes overwriting matching
+  files. Transports apply best-effort filters for common `.git` paths, and the
+  pull transports stage guest data before a trusted host-side filtered
+  installation, but pulled content remains untrusted and may be malicious.
+  Repositories pulled by older affected
+  releases must be recreated from a trusted source before use with host Git.
+  The now-redundant `coop pull --exclude-git` flag has been removed; pull's
+  best-effort filtering is unconditional.
+
 ### Removed
 
 - Removed devcontainer discovery, translation, OCI Feature installation, and
