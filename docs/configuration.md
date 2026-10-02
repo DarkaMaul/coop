@@ -233,15 +233,6 @@ The name is validated against the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}
 
 The guest user is **baked into the image at setup time and immutable for the image's lifetime** — it is persisted in the image's `template_config.json`, and `up` / `start` / `shell` / `exec` read it back from there. To change it, destroy and recreate the image: `coop destroy && coop setup --guest-user <name>`.
 
-### devcontainer `remoteUser`
-
-When a workspace's `devcontainer.json` declares a `remoteUser` (e.g. `vscode` for the Microsoft devcontainer base images), the handling depends on the stage:
-
-- **At `coop setup`**, a valid `remoteUser` becomes the image's guest user unless `--guest-user` already pins one (the CLI flag wins, and the override is reported).
-- **At `coop up` / `coop start`**, the guest user is already baked in. If the file's `remoteUser` matches the image's persisted user, it is applied; if it differs, coop reports the mismatch, skips forwarding `containerEnv` (its values often reference a `/home/<remoteUser>/...` path that doesn't exist on disk), and points you at `coop destroy && coop setup --guest-user <remoteUser>` to switch.
-
-See [Devcontainer support](devcontainer.md) for the full translation table.
-
 ## Guest PATH
 
 Every guest SSH session — login, non-login, and `exec` — has the guest user's `~/.local/bin` on `PATH`. coop prepends it to `PATH` in `/etc/environment`, which `pam_env` applies to all sessions. This is where the Claude Code installer places its per-user `claude` binary.

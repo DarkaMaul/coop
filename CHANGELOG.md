@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Removed
+
+- Removed devcontainer discovery, translation, OCI Feature installation, and
+  the `coop devcontainer` command (issue #525). The `--devcontainer`,
+  `--no-devcontainer`, and devcontainer translation `--dry-run` flags are no
+  longer accepted. Use coop profiles and the explicit workspace, environment,
+  port, and post-start options. Rebuild existing images and reprovision or
+  recreate existing VMs to remove previously installed Features. Existing
+  instances can also retain saved guest environment entries and port forwards;
+  destroy and recreate them to clear that state.
+
 ### New features
 
 - **Grok Build** — `coop grok` launches Grok Build inside the guest with
