@@ -8,10 +8,14 @@
   the `coop devcontainer` command (issue #525). The `--devcontainer`,
   `--no-devcontainer`, and devcontainer translation `--dry-run` flags are no
   longer accepted. Use coop profiles and the explicit workspace, environment,
-  port, and post-start options. Rebuild existing images and reprovision or
-  recreate existing VMs to remove previously installed Features. Existing
-  instances can also retain saved guest environment entries and port forwards;
-  destroy and recreate them to clear that state.
+  port, and post-start options. Rebuild affected images to remove previously
+  installed Features, profiles, and guest-user choices. Existing instances can
+  retain saved guest environment entries, port forwards, resource settings,
+  and mounts. Destroy and recreate them to clear that state. In particular, an
+  existing Lima VM can retain a live writable host share from a translated mount;
+  reprovisioning its disk does not remove that persisted VM configuration.
+  Obsolete devcontainer preference and per-instance snapshot files are removed
+  during private-storage preparation.
 
 ### New features
 

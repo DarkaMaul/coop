@@ -173,9 +173,10 @@ its association with the VM state, leaving the shared PAT intact.
 
 An active assignment rejects managed `GITHUB_TOKEN` **and** `GH_TOKEN` entries
 in `[guest_env]`, Claude, Codex, or Grok `env_forward`, a Grok stdio MCP `env`
-value that names either variable, or persisted `--env` / `containerEnv`
-overrides. Remove these conflicting entries, including saved keys in
-`<instance>/guest_env.json`, or unassign the PAT. This controls coop's
+value that names either variable, or persisted `--env` overrides. Instances
+created by older coop versions can also retain legacy devcontainer
+`containerEnv` overrides. Remove these conflicting entries, including saved
+keys in `<instance>/guest_env.json`, or unassign the PAT. This controls coop's
 delivery; the guest can still change its own environment. The VM receives the
 token's actual authority over every repository it covers.
 

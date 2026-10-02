@@ -1,7 +1,10 @@
 //! Per-instance snapshot of start-time guest env overrides.
 //!
-//! Mirrors [`crate::port_forward::ForwardsState`]. CLI `--env` entries
-//! are saved so later shell and exec invocations can reapply them.
+//! Mirrors [`crate::port_forward::ForwardsState`]. Current versions save CLI
+//! `--env` entries so later shell and exec invocations can reapply them. A
+//! snapshot created before devcontainer support was removed can also contain
+//! translated `containerEnv` entries; those remain readable so existing
+//! instances keep their established environment until they are recreated.
 //!
 //! `[guest_env]` from `config.toml` is deliberately *not* in the snapshot:
 //! it is re-read on every invocation, so persisting it would freeze edits
@@ -100,7 +103,7 @@ impl<'de> Deserialize<'de> for EnvVarName {
     }
 }
 
-/// Persisted CLI `--env` snapshot, applied on later invocations for this instance.
+/// Persisted start-time guest environment, applied on later invocations.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GuestEnvState {
     /// Entries to overlay onto the resolved env-forward set. `BTreeMap`
@@ -293,9 +296,8 @@ mod tests {
 
     // ── property tests ───────────────────────────────────────
 
-    /// Keys drawn from a deliberately small space so independently generated
-    /// maps overlap often, exercising the CLI-wins-on-collision path rather
-    /// than only disjoint unions.
+    /// Keys drawn from a deliberately small space to exercise varied map
+    /// sizes and repeated generated values.
     fn small_env_map() -> impl Strategy<Value = BTreeMap<EnvVarName, String>> {
         prop::collection::btree_map(
             "[A-E]".prop_map(|s| EnvVarName::new(&s).unwrap()),

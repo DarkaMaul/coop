@@ -868,10 +868,11 @@ fn restart_instance(
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
-    // Re-apply the persisted guest-env set from the initial start
-    // (CLI `--env`). New start-time
-    // entries on restart override per-key; the merged result is what
-    // gets persisted (and forwarded for this restart's bootstrap).
+    // Re-apply the persisted guest-env set from the initial start. Current
+    // versions persist CLI `--env`; legacy snapshots can also contain values
+    // translated from devcontainer `containerEnv`. New start-time entries on
+    // restart override per-key; the merged result is what gets persisted (and
+    // forwarded for this restart's bootstrap).
     let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
         .map(|s| s.entries)
         .unwrap_or_default();
@@ -1355,14 +1356,14 @@ pub(crate) fn open_ssh_session(
 /// post-boot bootstrap in fresh start and restart, where the
 /// instance isn't yet registered as running.
 ///
-/// When `inst` is `Some`, any persisted `--env` snapshot for that
-/// instance is overlaid onto the resolved env-forward set so values
-/// passed at `coop start --env KEY=VAL` survive across the
-/// per-invocation config reload. Bootstrap callers inside fresh
-/// `start_instance` pass `None` because the in-memory `cfg.guest_env`
-/// is already authoritative for that one process; restart and every
-/// post-start command pass `Some` because the on-disk snapshot is
-/// the only place the original `--env` set still lives.
+/// When `inst` is `Some`, any persisted start-time guest environment for that
+/// instance is overlaid onto the resolved env-forward set. This keeps current
+/// `coop start --env KEY=VAL` values and legacy devcontainer `containerEnv`
+/// values available across the per-invocation config reload. Bootstrap callers
+/// inside fresh `start_instance` pass `None` because the in-memory
+/// `cfg.guest_env` is already authoritative for that one process; restart and
+/// every post-start command pass `Some` because the on-disk snapshot is the
+/// only place the original persisted set still lives.
 /// Open a session and run the post-boot agent bootstrap plus any
 /// `post_start` hook, honoring `--no-agents`. Shared by fresh start and
 /// restart, which differ only in the [`backend::BootMode`].

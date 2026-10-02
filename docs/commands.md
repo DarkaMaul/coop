@@ -90,12 +90,20 @@ recreate it with different creation options. Runtime startup options such as
 restarts an instance; if the matching instance is already running, stop it
 first so those options can take effect.
 
-Devcontainer discovery, translation, and the `coop devcontainer` command were
-removed in issue #525. Use coop profiles, `--env`, `--forward-port`, mounts,
-and `--post-start` explicitly. Rebuild an existing image to remove previously
-installed OCI Features; existing VM disks also retain their installed software
-until recreated or reprovisioned. Existing instances can retain previously
-saved guest environment entries and port forwards until destroyed and recreated.
+Devcontainer files are ordinary workspace data; coop does not discover,
+translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
+mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
+agent bootstrap but before a copied workspace or Firecracker mount is synced;
+commands that require project files must run after `coop up` completes.
+
+Upgrading does not rewrite existing images or VMs. Rebuild affected images to
+remove previously installed OCI Features, profiles, or a devcontainer-derived
+guest user. Destroy and recreate existing instances to remove saved guest
+environment and port-forward state, devcontainer-derived CPU, memory, or disk
+settings, and old mounts. This is especially important on macOS, where a mount
+already recorded in a Lima VM remains a live writable host share when that VM
+restarts. Reprovisioning replaces the guest disk but does not remove the Lima
+VM's persisted mount configuration.
 
 ### `quickstart`
 
