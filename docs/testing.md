@@ -228,21 +228,73 @@ cargo install cargo-mutants --locked
 refactoring one (capture surviving mutants first to know what behavior isn't
 pinned down). Don't run it routinely — runs take minutes per module.
 
-**Where it pays off in this crate.** Focus on logic with branches, parsing,
-arithmetic, and state composition in `config.rs`, `workspace.rs`,
-`guest_env_state.rs`, `github_repo.rs`, `github_pat.rs`, `secret_store.rs`,
-`fs_util.rs`, and pure helpers under `src/commands/`. Backend orchestration,
-TTY prompts, and stdout writers are scoped out in `.cargo/mutants.toml` because
-library tests cannot observe their effects. Integration tests cover those paths.
+**Where it pays off in this crate.** Only on code with branches, arithmetic,
+parsing, or state composition:
+
+- `src/config.rs` — parsing, validation, defaults, env composition
+- `src/workspace.rs` — rsync arg construction, mount-state record/remove
+- `src/guest_env_state.rs` — env merging and persistence
+- `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
+  parsing and secret routing
+- `src/fs_util.rs` — path manipulation helpers
+- `src/commands/` — pure input-compatibility guards, summary/message builders,
+  byte-to-GiB arithmetic kernels, and predicates such as
+  `is_sensitive_workspace`
+
+**Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`,
+`update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`,
+`prompt.rs` (TTY prompts), `main.rs`, and — inside `src/commands/` — the
+`cmd_*` dispatch entrypoints and handlers that take a `&PlatformBackend`, write
+stdout, or open a TTY prompt. These mostly shell out, run SSH, or talk to
+external services, so unit tests cannot observe their effects. The integration
+suite covers those paths. This inventory is enforced by
+`.cargo/mutants.toml`, not merely advisory.
 
 ### Scoping (`.cargo/mutants.toml`)
 
-Keep `.cargo/mutants.toml` synchronized when adding or removing logic.
-Exclude IO and backend orchestration functions by name; leave pure helpers in
-scope and cover them with discriminating assertions. Run `cargo mutants -f
-<touched files> -- --lib` for a full touched-file sweep. The
-[`mutation-check`](../.agents/skills/mutation-check/SKILL.md) skill describes
-the workflow.
+The mutation surface is curated in `.cargo/mutants.toml` so the `missed` list
+means "real unit-test gap," not "code a `--lib` test structurally cannot reach."
+cargo-mutants reads this file automatically on every run (`--list` included).
+It scopes out:
+
+- Whole IO/backend modules through `exclude_globs`, including `main.rs` and
+  `prompt.rs`.
+- `cfg(kani)` proofs through `exclude_re = ["proofs::"]`; normal builds never
+  compile them, and `cargo kani` exercises them separately.
+- Shell-out, filesystem, network, stdout, backend, and terminal functions in
+  otherwise logic-bearing modules through `\b`-anchored `exclude_re` entries.
+- The `src/commands/` dispatch entrypoints and backend-driving or TTY handlers,
+  while leaving their extracted pure helpers in scope.
+
+What is deliberately *kept* (a survivor here is a genuine coverage
+regression) includes `parse_curl_status_body`, `parse_user_login`,
+`parse_gh_token`, `pick_backend`, `doc_contains_literal_token`, the SSH-config
+marker-block helpers, `CmdToken::from_words`, `atomic_write_with_mode`, and the
+editor strategy helpers. The thin IO wrappers around them are excluded because
+a `--lib` test cannot reach the real host filesystem, network, or launcher.
+
+The same split applies in `src/commands/`. Kept helpers include
+`ensure_up_existing_inputs_are_compatible[_for_git_repo]`,
+`up_has_restart_only_inputs`, `restart_has_ignored_creation_flags`,
+`find_workspace_instance`, `find_git_repo_instance`,
+`no_stopped_instance_message`, `creation_options_rejected_message`, profile
+summary builders, `bytes_to_gib`, `format_dir_size`, `project_dir_to_str`, and
+`is_sensitive_workspace`. Their backend-driving wrappers remain excluded.
+
+The `coop model` feature follows the same split. `tools_needing_prompt`,
+`switch_report_lines`, `ModelState` resolution/default logic, and
+`ModelMode::as_str` stay in scope and are unit-tested. The stdout, backend, and
+TTY operations in `commands/model.rs` and lifecycle bootstrap remain excluded.
+
+**Keep `.cargo/mutants.toml` in sync in the same PR that adds or removes the
+code.** This is not a follow-up chore. Issue #373 showed that missing exclusions
+for new IO/backend/TTY functions can silently turn the documented zero-missed
+baseline into a list of non-actionable survivors. Add anchored exclusions for
+IO, leave pure logic in scope, and cover it with discriminating assertions.
+Verify with `cargo mutants -f <touched files> -- --lib`; an `--in-diff` sweep
+only mutates changed lines and can miss pre-existing same-class survivors in a
+touched file. The [`mutation-check`](../.agents/skills/mutation-check/SKILL.md)
+skill walks this workflow.
 
 ### Running it
 
@@ -253,6 +305,9 @@ and reports every mutant as missed.)
 ```bash
 # One file
 cargo mutants -f src/config.rs -- --lib
+
+# Several logic modules at once
+cargo mutants -f src/config.rs -f src/workspace.rs -f src/guest_env_state.rs -- --lib
 
 # PR-scoped: mutate only lines changed vs main
 cargo mutants --in-diff <(git diff origin/main -- 'src/*.rs') -- --lib
@@ -291,7 +346,22 @@ For each line in `missed.txt`:
 
 ### Baselines
 
-Historical mutation results are snapshots of the code at the time. Re-run a touched-file sweep before relying on a prior baseline.
+Historical mutation results are snapshots of the code at the time. Re-run a
+touched-file sweep before relying on one:
+
+- **2026-06-17 (after #329 scoping, #321–#330 fixes).** The then-current logic
+  module sweep reported zero missed mutants. For the surviving modules
+  (`config.rs`, `workspace.rs`, `guest_env_state.rs`, `github_repo.rs`,
+  `github_pat.rs`, `secret_store.rs`, and `fs_util.rs`), a new survivor remains
+  a coverage regression unless it belongs to an IO function that should be
+  scoped out.
+- **2026-06-24 (issue #344).** The then-current commands and parser sweep
+  reported zero missed mutants. Removed modules no longer apply; surviving
+  pure command helpers retain the zero-missed expectation.
+- **2026-06-26 (issue #373).** After scoping the local-model IO/backend/TTY
+  functions and adding the missing model-state tests, the model sweep reported
+  zero missed mutants (32 caught, 3 unviable), and a full `src/lib.rs` sweep
+  reported zero missed mutants (11 caught).
 
 ## Fuzzing
 

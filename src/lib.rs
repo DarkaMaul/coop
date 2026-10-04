@@ -2451,26 +2451,66 @@ token = "test-pat"
     #[test]
     fn devcontainer_interface_is_removed() {
         assert!(matches!(parse(&["up"]).command, super::Commands::Up { .. }));
-        for args in [
-            &["devcontainer", "check", "file.json"][..],
-            &["up", "--devcontainer", "file.json"][..],
-            &["up", "--no-devcontainer"][..],
-            &["up", "--dry-run"][..],
-            &["setup", "--workspace", "."][..],
-            &["setup", "--devcontainer", "file.json"][..],
-            &["quickstart", "--no-devcontainer"][..],
-            &["start", "--devcontainer", "file.json"][..],
-            &["start", "--dry-run"][..],
+        for (args, expected) in [
+            (
+                &["devcontainer", "check", "file.json"][..],
+                clap::error::ErrorKind::InvalidSubcommand,
+            ),
+            (
+                &["up", "--devcontainer", "file.json"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["up", "--no-devcontainer"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["up", "--dry-run"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["up", "--json"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["setup", "--workspace", "."][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["setup", "--devcontainer", "file.json"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["setup", "--no-devcontainer"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["setup", "--dry-run"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["quickstart", "--no-devcontainer"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["start", "--devcontainer", "file.json"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["start", "--no-devcontainer"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["start", "--dry-run"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["start", "--json"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
         ] {
             let kind = parse_err(args).kind();
-            assert!(
-                matches!(
-                    kind,
-                    clap::error::ErrorKind::UnknownArgument
-                        | clap::error::ErrorKind::InvalidSubcommand
-                ),
-                "unexpected clap error for {args:?}: {kind:?}"
-            );
+            assert_eq!(kind, expected, "unexpected clap error for {args:?}");
         }
     }
 

@@ -1819,26 +1819,37 @@ mod tests {
     }
 
     #[test]
-    fn template_config_loads_legacy_json_without_guest_user_field() {
-        // Pre-PR images on disk have no `guest_user` field; the serde
-        // default keeps them deserializable as `ubuntu`. Regression
-        // guard against accidentally dropping the `#[serde(default)]`.
+    fn template_config_loads_legacy_json_and_drops_removed_fields() {
+        // Legacy images may omit fields added later and retain fields that no
+        // longer have meaning. They must remain readable without carrying the
+        // removed data into newly serialized state.
         let json = r#"{
             "version": 1,
             "created": "2026-01-01T00:00:00Z",
             "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "profiles": [],
+            "profiles": ["node"],
             "extra_packages": [],
-            "post_install_hash": null
+            "post_install_hash": null,
+            "oci_features": [{
+                "id": "ghcr.io/devcontainers/features/node",
+                "reference": "1",
+                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "install_script_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+            }]
         }"#;
         let tc: TemplateConfig = serde_json::from_str(json).unwrap();
         assert_eq!(tc.guest_user, GuestUser::default());
+        assert_eq!(tc.profiles, ["node"]);
         // Codex bake lists were added later; legacy JSON omits them and
         // must default to empty rather than failing to deserialize.
         assert!(tc.codex_marketplaces.is_empty());
         assert!(tc.codex_plugins.is_empty());
         assert!(tc.grok_marketplaces.is_empty());
         assert!(tc.grok_plugins.is_empty());
+
+        let serialized = serde_json::to_value(&tc).unwrap();
+        assert_eq!(serialized["version"], 1);
+        assert!(serialized.get("oci_features").is_none());
     }
 
     #[test]

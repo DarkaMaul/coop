@@ -1349,21 +1349,6 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
-/// Build an `SshSession` from an already-resolved target.
-///
-/// Symmetric with `open_ssh_session`, for paths that resolve the
-/// target without going through `resolve_running` — namely the
-/// post-boot bootstrap in fresh start and restart, where the
-/// instance isn't yet registered as running.
-///
-/// When `inst` is `Some`, any persisted start-time guest environment for that
-/// instance is overlaid onto the resolved env-forward set. This keeps current
-/// `coop start --env KEY=VAL` values and legacy devcontainer `containerEnv`
-/// values available across the per-invocation config reload. Bootstrap callers
-/// inside fresh `start_instance` pass `None` because the in-memory
-/// `cfg.guest_env` is already authoritative for that one process; restart and
-/// every post-start command pass `Some` because the on-disk snapshot is the
-/// only place the original persisted set still lives.
 /// Open a session and run the post-boot agent bootstrap plus any
 /// `post_start` hook, honoring `--no-agents`. Shared by fresh start and
 /// restart, which differ only in the [`backend::BootMode`].
@@ -1465,6 +1450,20 @@ pub(crate) fn no_agents_skips_codex_keyring(
     no_agents && auth.uses_chatgpt_account() && !keyring_materialized()
 }
 
+/// Build an `SshSession` from an already-resolved target.
+///
+/// Symmetric with [`open_ssh_session`], for paths that resolve the target
+/// without going through `resolve_running` — namely the post-boot bootstrap in
+/// fresh start and restart, where the instance isn't yet registered as running.
+///
+/// When `inst` is `Some`, any persisted start-time guest environment for that
+/// instance is overlaid onto the resolved env-forward set. This keeps current
+/// `coop start --env KEY=VAL` values and legacy devcontainer `containerEnv`
+/// values available across the per-invocation config reload. Bootstrap callers
+/// inside fresh `start_instance` pass `None` because the in-memory
+/// `cfg.guest_env` is already authoritative for that one process; restart and
+/// every post-start command pass `Some` because the on-disk snapshot is the
+/// only place the original persisted set still lives.
 pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
     inst: Option<&config::Instance>,

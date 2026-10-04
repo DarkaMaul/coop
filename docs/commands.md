@@ -96,14 +96,16 @@ mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
 agent bootstrap but before a copied workspace or Firecracker mount is synced;
 commands that require project files must run after `coop up` completes.
 
-Upgrading does not rewrite existing images or VMs. Rebuild affected images to
-remove previously installed OCI Features, profiles, or a devcontainer-derived
-guest user. Destroy and recreate existing instances to remove saved guest
-environment and port-forward state, devcontainer-derived CPU, memory, or disk
-settings, and old mounts. This is especially important on macOS, where a mount
-already recorded in a Lima VM remains a live writable host share when that VM
-restarts. Reprovisioning replaces the guest disk but does not remove the Lima
-VM's persisted mount configuration.
+Upgrading does not rewrite existing images or VMs. Delete affected images with
+`coop images --delete <image>`, then recreate them with `coop setup --image
+<image>` and only the profiles, packages, and guest-user options you intend to
+retain. This removes previously installed OCI Features and unwanted profile or
+guest-user choices. Destroy and recreate existing instances to remove saved
+guest environment and port-forward state, devcontainer-derived CPU, memory,
+disk settings, and old mounts. This is especially important on macOS, where a
+mount already recorded in a Lima VM remains a live writable host share when
+that VM restarts. Reprovisioning replaces the guest disk but does not remove
+the Lima VM's persisted mount configuration.
 
 ### `quickstart`
 
@@ -825,6 +827,8 @@ Kept across the wipe, because coop persists them host-side:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
+- An invocation-level `--post-start` command. The override is not persisted;
+  reprovisioning runs the current `post_start` value from `config.toml`, if set.
 
 Before replacing the disk, coop checks that the image exists, the state files
 parse, the recorded workspace directory is still there, and host ports for

@@ -6661,15 +6661,17 @@ test_provision_failure() {
 test_removed_devcontainer_cli() {
     echo ""
     echo "=== Phase: removed devcontainer CLI ==="
-    if coop_fails devcontainer check missing.json; then
+    if coop_fails devcontainer check missing.json \
+        && [[ "$HARNESS_ERR" == *"unrecognized subcommand 'devcontainer'"* ]]; then
         pass "devcontainer subcommand is rejected"
     else
-        fail "devcontainer subcommand is rejected" "unexpectedly accepted"
+        fail "devcontainer subcommand is rejected" "stderr: $HARNESS_ERR"
     fi
-    if coop_fails up --devcontainer missing.json; then
+    if coop_fails up --devcontainer missing.json \
+        && [[ "$HARNESS_ERR" == *"unexpected argument '--devcontainer'"* ]]; then
         pass "up --devcontainer is rejected"
     else
-        fail "up --devcontainer is rejected" "unexpectedly accepted"
+        fail "up --devcontainer is rejected" "stderr: $HARNESS_ERR"
     fi
 }
 
