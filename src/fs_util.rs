@@ -1165,7 +1165,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .args(["+a", "everyone allow add_file"])
                 .arg(root.path())
                 .status()
@@ -1174,7 +1174,7 @@ mod tests {
         );
         assert!(private_dir(&root.path().join("private")).is_err());
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .arg("-N")
                 .arg(root.path())
                 .status()
@@ -1182,7 +1182,7 @@ mod tests {
                 .success()
         );
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .args(["+a", "everyone deny delete"])
                 .arg(root.path())
                 .status()
@@ -1193,7 +1193,7 @@ mod tests {
         let file = root.path().join("private/state.json");
         fs::write(&file, "canary").unwrap();
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .args(["+a", "everyone allow read"])
                 .arg(&file)
                 .status()
@@ -1201,7 +1201,11 @@ mod tests {
                 .success()
         );
         crate::private_storage::private_file(&file).unwrap();
-        let listing = Command::new("ls").arg("-le").arg(&file).output().unwrap();
+        let listing = Command::new("/bin/ls")
+            .arg("-le")
+            .arg(&file)
+            .output()
+            .unwrap();
         assert!(listing.status.success());
         assert!(!String::from_utf8_lossy(&listing.stdout).contains("allow read"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "canary");
