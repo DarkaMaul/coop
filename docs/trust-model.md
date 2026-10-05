@@ -60,6 +60,13 @@ user launched it.
   matching files but does not change their trust level. The transports attempt
   to omit common ASCII-case `.git` paths, and both pull transports write into
   an empty staging directory before a trusted host-side filtered installation.
+  The staging boundary is a host-owned `0700` outer directory under private
+  coop storage; transfer tools write only into its child. Pulls sharing a coop
+  data directory are serialized across destination authorization, transfer,
+  installation, and cleanup. All such pulls reuse one fixed staging tree, so
+  interrupted transfers cannot accumulate additional staging trees. Writer
+  subprocesses inherit the operation lock; a retry times out rather than
+  removing staging that an orphaned writer may still be using.
   Those filters are
   defense-in-depth, not a guarantee across every transport, Git, and filesystem
   naming behavior. Treat every pulled file and the resulting directory as

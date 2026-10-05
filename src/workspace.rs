@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -519,6 +520,7 @@ pub fn pull(running: &RunningInstance, dir: Option<&str>, force: bool) -> Result
     let target = running.target();
     let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir(dir, &state, "pull")?;
+    let operation = PullOperation::new(pull_staging_path(inst)?)?;
 
     if !force && pull_destination_is_nonempty(&dest_dir)? {
         bail!(
@@ -542,10 +544,10 @@ pub fn pull(running: &RunningInstance, dir: Option<&str>, force: bool) -> Result
     );
 
     if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
-        rsync_pull(target, &state.guest_path, &dest_dir)?;
+        rsync_pull(target, &state.guest_path, &dest_dir, &operation)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_pull(target, &state.guest_path, &dest_dir)?;
+        tar_pipe_pull(target, &state.guest_path, &dest_dir, &operation)?;
     }
 
     tracing::info!("Pull complete");
@@ -796,25 +798,28 @@ pub(crate) fn rsync_push(
     Ok(())
 }
 
-fn rsync_pull(target: &SshTarget, guest_path: &GuestPath, dest: &Path) -> Result<()> {
+fn rsync_pull(
+    target: &SshTarget,
+    guest_path: &GuestPath,
+    dest: &Path,
+    operation: &PullOperation,
+) -> Result<()> {
     let mut args = rsync_pull_args(target);
     args.push(format!("{}:{guest_path}/", target.addr()));
     // A compromised guest controls the remote rsync sender. Stage its file
     // list away from the destination, then apply the Git-metadata exclusion
     // again with the trusted host rsync during installation.
-    let mut staging = PullStaging::new()?;
+    let mut staging = operation.staging()?;
     args.push(format!("{}/", staging.path()?.display()));
 
     let result = (|| {
-        let status = Command::new("rsync")
-            .args(&args)
-            .status()
-            .context("Failed to run rsync")?;
+        let mut command = locked_rsync_command(&args, operation);
+        let status = command.status().context("Failed to run rsync")?;
 
         if !status.success() {
             bail!("rsync pull failed");
         }
-        install_staged_pull(staging.path()?, dest)
+        install_staged_pull(staging.path()?, dest, operation)
     })();
     staging.finish(result)
 }
@@ -823,6 +828,13 @@ fn rsync_pull_args(target: &SshTarget) -> Vec<String> {
     // Guest-authored Git administration data is active configuration, not
     // workspace content. Apply the common-name filter as defense-in-depth.
     rsync_base_args(target, true)
+}
+
+fn locked_rsync_command(args: &[String], operation: &PullOperation) -> Command {
+    let mut command = Command::new("rsync");
+    command.args(args);
+    operation.inherit_lock_in(&mut command);
+    command
 }
 
 // ── Transport: tar-pipe ───────────────────────────────────────
@@ -886,12 +898,16 @@ fn tar_pull_extract_cmd(dest: &Path) -> Command {
     command
 }
 
-fn install_staged_pull(source: &Path, dest: &Path) -> Result<()> {
+fn locked_tar_pull_extract_cmd(dest: &Path, operation: &PullOperation) -> Command {
+    let mut command = tar_pull_extract_cmd(dest);
+    operation.inherit_lock_in(&mut command);
+    command
+}
+
+fn install_staged_pull(source: &Path, dest: &Path, operation: &PullOperation) -> Result<()> {
     let args = install_staged_pull_args(source, dest);
-    let status = Command::new("rsync")
-        .args(args)
-        .status()
-        .context("Failed to install staged pull")?;
+    let mut command = locked_rsync_command(&args, operation);
+    let status = command.status().context("Failed to install staged pull")?;
 
     if !status.success() {
         bail!("Failed to install staged pull");
@@ -908,16 +924,21 @@ fn install_staged_pull_args(source: &Path, dest: &Path) -> Vec<String> {
     ]
 }
 
-fn tar_pipe_pull(target: &SshTarget, guest_path: &GuestPath, dest: &Path) -> Result<()> {
+fn tar_pipe_pull(
+    target: &SshTarget,
+    guest_path: &GuestPath,
+    dest: &Path,
+    operation: &PullOperation,
+) -> Result<()> {
     let remote_cmd = tar_pull_cmd(guest_path).into_string();
     // Never unpack an archive authored by the untrusted guest into an existing
     // host workspace. In particular, a tar hard-link entry can otherwise name
     // an allowed path while targeting an existing `.git/config`. An empty
     // staging directory makes such cross-boundary links fail before rsync
     // installs the ordinary workspace entries.
-    let mut staging = PullStaging::new()?;
+    let mut staging = operation.staging()?;
 
-    let result = tar_pipe_pull_staged(target, &remote_cmd, staging.path()?, dest);
+    let result = tar_pipe_pull_staged(target, &remote_cmd, staging.path()?, dest, operation);
     staging.finish(result)
 }
 
@@ -926,15 +947,18 @@ fn tar_pipe_pull_staged(
     remote_cmd: &str,
     staging: &Path,
     dest: &Path,
+    operation: &PullOperation,
 ) -> Result<()> {
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
     ssh_args.push(remote_cmd.to_string());
 
-    let mut ssh_child = Command::new("ssh")
+    let mut ssh_command = Command::new("ssh");
+    ssh_command
         .args(&ssh_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut ssh_child = ssh_command
         .spawn()
         .context("Failed to start SSH for tar-pipe pull")?;
 
@@ -947,9 +971,9 @@ fn tar_pipe_pull_staged(
         .take()
         .context("Failed to get SSH stderr")?;
 
-    let mut tar_child = tar_pull_extract_cmd(staging)
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut tar_command = locked_tar_pull_extract_cmd(staging, operation);
+    tar_command.stdin(Stdio::piped()).stderr(Stdio::piped());
+    let mut tar_child = tar_command
         .spawn()
         .context("Failed to start local tar extraction")?;
 
@@ -1015,43 +1039,108 @@ fn tar_pipe_pull_staged(
         );
     }
 
-    install_staged_pull(staging, dest)
+    install_staged_pull(staging, dest, operation)
 }
 
 // ── Helpers ───────────────────────────────────────────────────
 
+fn pull_staging_path(inst: &Instance) -> Result<PathBuf> {
+    let instances_dir = inst
+        .dir
+        .parent()
+        .context("Instance directory has no parent for pull staging")?;
+    let data_dir = instances_dir
+        .parent()
+        .context("Instances directory has no parent for pull staging")?;
+    Ok(data_dir.join("pull-staging/work"))
+}
+
 /// Host-owned staging directory for data received from an untrusted guest.
 ///
-/// The guest controls modes below this directory. Cleanup therefore restores
-/// owner traversal permissions without following symlinks before explicitly
-/// removing the tree. `Drop` is only a panic fallback; normal paths report a
+/// The stable outer directory is private and never exposed to the transfer
+/// tools. They receive into its `contents` child, whose mode the guest may
+/// replace. A global lock serializes pulls sharing the coop data directory. If the process
+/// dies before cleanup, the next pull removes the same bounded staging tree
+/// before recreating it. Cleanup restores owner traversal permissions without
+/// following symlinks. `Drop` is only a panic fallback; normal paths report a
 /// cleanup failure to the caller.
+struct PullOperation {
+    staging_root: PathBuf,
+    lock: crate::fs_util::FileLock,
+}
+
+impl PullOperation {
+    fn new(staging_root: PathBuf) -> Result<Self> {
+        let parent = staging_root
+            .parent()
+            .context("Pull staging path has no parent")?;
+        let _parent = crate::fs_util::PrivateDir::create(parent)
+            .context("Failed to prepare private pull staging storage")?;
+        // Serialize every pull that shares this private coop data directory,
+        // not just pulls from one instance. Otherwise two instances could
+        // both authorize the same empty destination before either installs.
+        let lock = crate::fs_util::lock_sibling_bounded(
+            &parent.join("pull"),
+            std::time::Duration::from_secs(30),
+        )
+        .context("Failed to lock pull staging directory")?;
+        Ok(Self { staging_root, lock })
+    }
+
+    fn staging(&self) -> Result<PullStaging> {
+        PullStaging::new(&self.staging_root)
+    }
+
+    fn inherit_lock_in(&self, command: &mut Command) {
+        self.lock.inherit_in(command);
+    }
+}
+
 struct PullStaging {
-    directory: Option<tempfile::TempDir>,
+    root: Option<PathBuf>,
+    contents: PathBuf,
 }
 
 impl PullStaging {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            directory: Some(
-                tempfile::tempdir().context("Failed to create pull staging directory")?,
-            ),
-        })
-    }
+    fn new(root: &Path) -> Result<Self> {
+        remove_staging_directory(root).context("Failed to remove stale pull staging directory")?;
 
-    #[cfg(test)]
-    fn new_in(parent: &Path) -> Result<Self> {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(root).with_context(|| {
+            format!("Failed to create pull staging directory {}", root.display())
+        })?;
+
+        let contents = root.join("contents");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        if let Err(error) = builder.create(&contents) {
+            let cleanup = fs::remove_dir(root);
+            return match cleanup {
+                Ok(()) => Err(error).with_context(|| {
+                    format!(
+                        "Failed to create pull staging contents directory {}",
+                        contents.display()
+                    )
+                }),
+                Err(cleanup_error) => Err(anyhow::Error::new(error).context(format!(
+                    "Failed to create pull staging contents directory {}; additionally failed to remove {}: {cleanup_error}",
+                    contents.display(),
+                    root.display()
+                ))),
+            };
+        }
+
         Ok(Self {
-            directory: Some(
-                tempfile::tempdir_in(parent).context("Failed to create pull staging directory")?,
-            ),
+            root: Some(root.to_path_buf()),
+            contents,
         })
     }
 
     fn path(&self) -> Result<&Path> {
-        self.directory
+        self.root
             .as_ref()
-            .map(tempfile::TempDir::path)
+            .map(|_| self.contents.as_path())
             .context("Pull staging directory is no longer available")
     }
 
@@ -1068,15 +1157,37 @@ impl PullStaging {
     }
 
     fn cleanup(&mut self) -> Result<()> {
-        let directory = self
-            .directory
+        let root = self
+            .root
             .take()
             .context("Pull staging directory was already cleaned")?;
-        let permissions = make_staging_directories_traversable(directory.path());
-        let removal = directory
-            .close()
-            .context("Failed to remove pull staging directory");
+        remove_staging_directory(&root).context("Failed to remove pull staging directory")
+    }
+}
 
+impl Drop for PullStaging {
+    fn drop(&mut self) {
+        let Some(root) = self.root.take() else {
+            return;
+        };
+        let _ = remove_staging_directory(&root);
+    }
+}
+
+fn remove_staging_directory(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect staging path {}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_dir() {
+        let permissions = make_staging_directories_traversable(path);
+        let removal = fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove staging path {}", path.display()));
         match (permissions, removal) {
             (_, Ok(())) => Ok(()),
             (Ok(()), Err(error)) => Err(error),
@@ -1085,16 +1196,13 @@ impl PullStaging {
                  {permission_error:#}"
             ))),
         }
-    }
-}
-
-impl Drop for PullStaging {
-    fn drop(&mut self) {
-        let Some(directory) = self.directory.take() else {
-            return;
-        };
-        let _ = make_staging_directories_traversable(directory.path());
-        let _ = directory.close();
+    } else {
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "Failed to remove non-directory staging path {}",
+                path.display()
+            )
+        })
     }
 }
 
@@ -1546,6 +1654,55 @@ mod tests {
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
         }
+    }
+
+    fn test_pull_operation(parent: &Path) -> PullOperation {
+        PullOperation::new(parent.join("pull-staging/work")).unwrap()
+    }
+
+    fn assert_writer_child_holds_pull_lock(
+        operation: PullOperation,
+        child: &mut std::process::Child,
+        lock_path: &Path,
+    ) {
+        use std::os::fd::AsRawFd as _;
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "writer exited too early"
+        );
+        drop(operation);
+
+        let probe = fs::OpenOptions::new().write(true).open(lock_path).unwrap();
+        // SAFETY: probe owns a valid descriptor for the duration of the call.
+        let lock_result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let lock_error = std::io::Error::last_os_error();
+        let process_group = i32::try_from(child.id()).unwrap();
+        // SAFETY: both fixtures put the writer in a process group whose ID is
+        // the child's PID. Killing the group also terminates rsync helpers that
+        // inherited the lock descriptor.
+        assert_eq!(unsafe { libc::kill(-process_group, libc::SIGKILL) }, 0);
+        child.wait().unwrap();
+        assert_eq!(
+            lock_result, -1,
+            "writer child did not retain the pull operation lock"
+        );
+        assert_eq!(lock_error.kind(), std::io::ErrorKind::WouldBlock);
+
+        let mut released = false;
+        for _ in 0..50 {
+            // SAFETY: probe owns a valid descriptor for every attempt.
+            if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            released,
+            "writer process group did not release the pull lock"
+        );
     }
 
     #[test]
@@ -2522,7 +2679,8 @@ Host coop-other\n\
 
         let parent = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut staging = PullStaging::new_in(parent.path()).unwrap();
+        let operation = test_pull_operation(parent.path());
+        let mut staging = operation.staging().unwrap();
         let staging_path = staging.path().unwrap().to_path_buf();
         let locked = staging.path().unwrap().join("locked");
         fs::create_dir(&locked).unwrap();
@@ -2548,13 +2706,154 @@ Host coop-other\n\
     }
 
     #[test]
+    fn pull_staging_path_is_a_stable_private_storage_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let instances = temp.path().join("instances");
+        let inst = temp_instance(&instances.join("test"));
+
+        assert_eq!(
+            pull_staging_path(&inst).unwrap(),
+            temp.path().join("pull-staging/work")
+        );
+    }
+
+    #[test]
+    fn pull_staging_outer_directory_stays_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "COOP_PULL_STAGING_PRIVATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::pull_staging_outer_directory_stays_private_under_permissive_umask",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        // SAFETY: only this isolated child test changes the process umask.
+        unsafe {
+            libc::umask(0);
+        }
+        let parent = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let operation = test_pull_operation(parent.path());
+        let mut staging = operation.staging().unwrap();
+        fs::set_permissions(staging.path().unwrap(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        let outer = parent.path().join("pull-staging/work");
+        assert_eq!(
+            fs::metadata(&outer).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "guest-controlled modes below staging must not expose its outer boundary"
+        );
+        staging.finish(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn pull_staging_replaces_the_bounded_tree_left_by_an_interrupted_pull() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("pull-staging/work");
+        let stale = root.join("contents/locked");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("guest-file"), "stale").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let operation = test_pull_operation(parent.path());
+        let mut staging = operation.staging().unwrap();
+
+        assert_eq!(staging.path().unwrap(), root.join("contents"));
+        assert_eq!(fs::read_dir(staging.path().unwrap()).unwrap().count(), 0);
+        staging.finish(Ok(())).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn pull_staging_cleanup_propagates_inspection_errors_other_than_missing() {
+        let parent = tempfile::tempdir().unwrap();
+        let non_directory = parent.path().join("file");
+        fs::write(&non_directory, "not a directory").unwrap();
+
+        let error = remove_staging_directory(&non_directory.join("child")).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Failed to inspect staging path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn pull_rsync_writer_keeps_operation_lock_after_parent_guard_drops() {
+        use std::os::unix::process::CommandExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source");
+        let dest = parent.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("large"), vec![0; 1024 * 1024]).unwrap();
+
+        let operation = test_pull_operation(parent.path());
+        let args = vec![
+            "-a".to_string(),
+            "--bwlimit=1".to_string(),
+            format!("{}/", source.display()),
+            format!("{}/", dest.display()),
+        ];
+        let mut command = locked_rsync_command(&args, &operation);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+
+        assert_writer_child_holds_pull_lock(
+            operation,
+            &mut child,
+            &parent.path().join("pull-staging/.pull.operation.lock"),
+        );
+    }
+
+    #[test]
+    fn pull_tar_writer_keeps_operation_lock_after_parent_guard_drops() {
+        use std::os::unix::process::CommandExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let operation = test_pull_operation(parent.path());
+        let mut command = locked_tar_pull_extract_cmd(&dest, &operation);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let _stdin = child.stdin.take().unwrap();
+
+        assert_writer_child_holds_pull_lock(
+            operation,
+            &mut child,
+            &parent.path().join("pull-staging/.pull.operation.lock"),
+        );
+    }
+
+    #[test]
     fn pull_staging_drop_is_a_cleanup_fallback() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let parent = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let operation = test_pull_operation(parent.path());
         let staging_path = {
-            let staging = PullStaging::new_in(parent.path()).unwrap();
+            let staging = operation.staging().unwrap();
             let staging_path = staging.path().unwrap().to_path_buf();
             let locked = staging.path().unwrap().join("locked");
             fs::create_dir(&locked).unwrap();
@@ -2644,10 +2943,13 @@ Host coop-other\n\
 
         let root = PathBuf::from(root);
         let dest = root.join("dest");
+        let staging = root.join("pull-tmp/staging");
+        let operation = PullOperation::new(staging.clone()).unwrap();
         rsync_pull(
             &fake_ssh_target(),
             &GuestPath::absolute("/workspace").unwrap(),
             &dest,
+            &operation,
         )
         .unwrap();
         assert_eq!(
@@ -2658,7 +2960,7 @@ Host coop-other\n\
             fs::read_to_string(dest.join(".git/config")).unwrap(),
             "host-owned\n"
         );
-        assert_eq!(fs::read_dir(root.join("pull-tmp")).unwrap().count(), 0);
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -2791,10 +3093,13 @@ Host coop-other\n\
 
         let root = PathBuf::from(root);
         let dest = root.join("dest");
+        let staging = root.join("pull-tmp/staging");
+        let operation = PullOperation::new(staging.clone()).unwrap();
         let result = tar_pipe_pull(
             &fake_ssh_target(),
             &GuestPath::absolute("/workspace").unwrap(),
             &dest,
+            &operation,
         );
         assert!(
             result.is_err(),
@@ -2804,7 +3109,7 @@ Host coop-other\n\
             fs::read_to_string(dest.join(".git/config")).unwrap(),
             "host-owned\n"
         );
-        assert_eq!(fs::read_dir(root.join("pull-tmp")).unwrap().count(), 0);
+        assert!(!staging.exists());
         assert!(!dest.join("alias").exists());
     }
 
@@ -2819,7 +3124,8 @@ Host coop-other\n\
         fs::write(staging.join(".GiT/config"), "guest-controlled\n").unwrap();
         fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
 
-        install_staged_pull(&staging, &dest).unwrap();
+        let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
+        install_staged_pull(&staging, &dest, &operation).unwrap();
 
         assert_eq!(
             fs::read_to_string(dest.join("workspace-file")).unwrap(),
