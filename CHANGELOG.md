@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Security
+
+- Stop invoking host Git during `coop pull`. Pull now refuses a nonempty
+  destination unless `--force` explicitly authorizes overwriting matching
+  files. Transports apply best-effort filters for common `.git` paths, and the
+  pull transports stage guest data before a trusted host-side filtered
+  installation. The staging boundary is a host-owned `0700` directory, and
+  pulls sharing a coop data directory are serialized through authorization,
+  transfer, installation, and cleanup. Local writer processes retain that lock
+  if coop is interrupted, so another pull times out instead of reusing an
+  active staging tree. Stale staging data is bounded to one tree and replaced
+  on retry. Pulled content remains untrusted and may be malicious.
+  Repositories pulled by older affected
+  releases must be recreated from a trusted source before use with host Git.
+  The now-redundant `coop pull --exclude-git` flag has been removed; pull's
+  best-effort filtering is unconditional.
+
 ### Removed
 
 - Removed devcontainer discovery, translation, OCI Feature installation, and

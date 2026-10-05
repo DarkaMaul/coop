@@ -1118,7 +1118,8 @@ fn provision_first_boot(
             }
             tracing::warn!(
                 "Firecracker mounts use one-time sync, not live filesystem sharing. \
-                 Use `coop push` / `coop pull` to sync changes."
+                 Use `coop push` to update the guest, or \
+                 `coop pull --dir <new-directory>` to review guest changes."
             );
         }
     }
