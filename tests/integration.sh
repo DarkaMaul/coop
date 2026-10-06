@@ -2697,6 +2697,50 @@ test_guest_fingerprint() {
 
 # ── Stop / status-stopped / restart ───────────────────────────
 
+test_stop_preserves_recent_writes() {
+    echo ""
+    echo "=== Phase: stop preserves recent guest writes ==="
+
+    if coop_exec python3 -c '
+from pathlib import Path
+import os
+root = Path.home() / ".coop-stop-durability-test"
+root.mkdir(exist_ok=True)
+(root / "changed").write_text("before")
+(root / "deleted").write_text("before")
+os.sync()
+(root / "changed").write_text("after")
+(root / "created").write_text("new")
+(root / "deleted").unlink()
+'; then
+        pass "write guest disk changes before stop"
+    else
+        fail "write guest disk changes before stop" "stderr: $(guest_stderr)"
+        return
+    fi
+    if ! coop stop "$INSTANCE"; then
+        fail "stop after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! coop start "$INSTANCE" --no-agents; then
+        fail "restart after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if coop_exec python3 -c '
+from pathlib import Path
+import shutil
+root = Path.home() / ".coop-stop-durability-test"
+assert (root / "changed").read_text() == "after", "overwrite lost"
+assert (root / "created").read_text() == "new", "new file lost"
+assert not (root / "deleted").exists(), "deleted file restored"
+shutil.rmtree(root)
+'; then
+        pass "recent writes and deletion survive stop/start"
+    else
+        fail "recent writes and deletion survive stop/start" "stderr: $(guest_stderr)"
+    fi
+}
+
 test_stop() {
     echo ""
     echo "=== Phase: stop ==="
@@ -4257,13 +4301,17 @@ test_workspace_sync() {
             "git rev-parse HEAD failed: $(guest_stderr)"
     fi
 
-    # Modify file in guest, then pull
-    coop_exec sh -c 'echo modified-in-guest > /workspace/hello.txt' || true
+    # Modify a worktree file and both spellings of Git administration data in
+    # the guest. Pull must retrieve only the worktree change. The mixed-case
+    # alias matters on case-insensitive macOS filesystems, where it resolves to
+    # the same destination entry as `.git`.
+    coop_exec sh -c \
+        'echo modified-in-guest > /workspace/hello.txt && git -C /workspace config core.fsmonitor ./guest-payload && mkdir -p /workspace/.GIT && echo guest-alias > /workspace/.GIT/config' || true
 
     local pull_dir
     pull_dir=$(mktemp -d)
-    if coop pull "$ws_instance" --force --dir "$pull_dir"; then
-        pass "pull exits 0"
+    if coop pull "$ws_instance" --dir "$pull_dir"; then
+        pass "pull into empty destination exits 0 without --force"
 
         local pulled
         pulled=$(cat "$pull_dir/hello.txt" 2>/dev/null)
@@ -4272,10 +4320,95 @@ test_workspace_sync() {
         else
             fail "pull retrieves guest changes" "got: $pulled"
         fi
+        if [[ ! -e "$pull_dir/.git" && ! -e "$pull_dir/.GIT" ]]; then
+            pass "pull best-effort filter omits common guest Git paths"
+        else
+            fail "pull best-effort filter omits common guest Git paths" \
+                "guest .git or case alias reached the host"
+        fi
+        if echo "$HARNESS_ERR" | grep -q "potentially malicious"; then
+            pass "pull warns that guest-controlled files may be malicious"
+        else
+            fail "pull warns that guest-controlled files may be malicious" \
+                "stderr: $HARNESS_ERR"
+        fi
     else
         fail "pull exits 0" "exit code: $?"
     fi
     rm -rf "$pull_dir"
+
+    # A destination populated by an affected older release may contain active
+    # Git configuration. Pull must reject a nonempty destination without
+    # invoking host Git. The clean-filter fixture models a legacy destination,
+    # while the PATH probe records any host Git invocation directly.
+    local legacy_root legacy_repo legacy_marker legacy_git_probe legacy_git_bin
+    legacy_root=$(mktemp -d)
+    legacy_repo="$legacy_root/repo"
+    legacy_marker="$legacy_root/HOST_GIT_EXECUTED"
+    legacy_git_probe="$legacy_root/HOST_GIT_INVOKED"
+    legacy_git_bin="$legacy_root/bin"
+    git init -q "$legacy_repo"
+    git -C "$legacy_repo" config user.name "coop integration"
+    git -C "$legacy_repo" config user.email "coop@example.invalid"
+    printf 'original\n' > "$legacy_repo/tracked"
+    printf 'tracked filter=coop-host-marker\n' > "$legacy_repo/.gitattributes"
+    git -C "$legacy_repo" add tracked .gitattributes
+    git -C "$legacy_repo" commit -qm baseline
+    git -C "$legacy_repo" config filter.coop-host-marker.clean \
+        "sh -c 'touch \"$legacy_marker\"; cat'"
+    printf 'changed!\n' > "$legacy_repo/tracked"
+    mkdir "$legacy_git_bin"
+    cat > "$legacy_git_bin/git" <<EOF
+#!/bin/sh
+touch "$legacy_git_probe"
+exit 99
+EOF
+    chmod +x "$legacy_git_bin/git"
+
+    if PATH="$legacy_git_bin:$PATH" coop pull "$ws_instance" --dir "$legacy_repo"; then
+        fail "pull refuses nonempty destination without --force" \
+            "pull unexpectedly succeeded"
+    elif echo "$HARNESS_ERR" | grep -q "non-empty destination" &&
+            echo "$HARNESS_ERR" | grep -q -- "--force"; then
+        pass "pull refuses nonempty destination without --force"
+    else
+        fail "pull refusal explains --force" "stderr: $HARNESS_ERR"
+    fi
+    if [[ ! -e "$legacy_marker" && ! -e "$legacy_git_probe" ]]; then
+        pass "pull refusal does not invoke host Git on legacy destination"
+    else
+        fail "pull refusal does not invoke host Git on legacy destination" \
+            "host Git was invoked or the guest-authored clean filter executed"
+    fi
+
+    if PATH="$legacy_git_bin:$PATH" coop pull "$ws_instance" --force --dir "$legacy_repo"; then
+        pass "pull --force authorizes nonempty destination"
+    else
+        fail "pull --force authorizes nonempty destination" \
+            "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+    if [[ ! -e "$legacy_marker" && ! -e "$legacy_git_probe" ]]; then
+        pass "pull --force does not invoke host Git"
+    else
+        fail "pull --force does not invoke host Git" \
+            "host Git was invoked or the guest-authored clean filter executed"
+    fi
+    rm -rf "$legacy_root"
+
+    local host_git_before host_git_after
+    host_git_before=$(cksum "$ws_tmpdir/.git/config")
+    if coop pull "$ws_instance" --force --dir "$ws_tmpdir"; then
+        host_git_after=$(cksum "$ws_tmpdir/.git/config")
+        if [[ "$host_git_after" == "$host_git_before" ]] &&
+                ! grep -q core.fsmonitor "$ws_tmpdir/.git/config"; then
+            pass "pull best-effort filter leaves common host Git path untouched"
+        else
+            fail "pull best-effort filter leaves common host Git path untouched" \
+                "host .git config changed"
+        fi
+    else
+        fail "pull into existing host repository exits 0" "exit code: $?"
+    fi
 
     # Push: modify locally, push to guest, verify
     echo "pushed-from-host" > "$ws_tmpdir/hello.txt"
@@ -4305,10 +4438,11 @@ test_workspace_sync() {
 
 # macOS hosts: `coop up --copy` streams the workspace through host tar, whose
 # default copyfile(3) metadata path emits AppleDouble `._*` sidecar entries
-# for xattrs/resource forks. Those land in the Linux guest as ordinary files
-# (they can break Git's pack/ref discovery inside .git/) and get pulled back
-# to the host. coop sets COPYFILE_DISABLE=1 on host-side tar creation to
-# suppress them; this phase reproduces the round-trip and pins the fix.
+# for xattrs/resource forks. Those land in the Linux guest as ordinary files;
+# entries inside .git can break Git's pack/ref discovery, while worktree
+# sidecars can be pulled back to the host. coop sets COPYFILE_DISABLE=1 on
+# host-side tar creation to suppress them; this phase reproduces the round-trip
+# and pins the fix.
 # Skipped off macOS, where tar has no copyfile path.
 test_appledouble_sidecars() {
     echo ""
@@ -6709,6 +6843,23 @@ test_guest_user_validation() {
     fi
 }
 
+test_pull_cli_validation() {
+    echo ""
+    echo "=== Phase: pull CLI validation ==="
+
+    if coop_fails pull --exclude-git; then
+        if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-git" <<< "$HARNESS_ERR"; then
+            pass "pull --exclude-git is rejected as an unknown flag"
+        else
+            fail "pull --exclude-git is rejected as an unknown flag" \
+                "unexpected error: $HARNESS_ERR"
+        fi
+    else
+        fail "pull --exclude-git is rejected as an unknown flag" \
+            "pull unexpectedly accepted a no-op flag"
+    fi
+}
+
 # ── Alternate guest user lifecycle (--full only) ──────────────
 
 test_guest_user_alt() {
@@ -6912,6 +7063,7 @@ EOF
     test_completions
     test_removed_devcontainer_cli
     test_guest_user_validation
+    test_pull_cli_validation
 
     # Setup + primary instance
     test_setup
@@ -6949,6 +7101,7 @@ EOF
     test_guest_fingerprint
 
     # Stop + restart + stopped-state verification
+    test_stop_preserves_recent_writes
     test_stop
     test_stop_idempotency
     test_auto_resolve_stopped
