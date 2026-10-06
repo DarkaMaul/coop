@@ -1,10 +1,10 @@
 # Shell completion
 
-`coop` ships with both static and dynamic shell completion via `clap_complete`. Static completion handles subcommand and flag names; dynamic completion additionally fills in live values for instance names, image names, and profile names by reading `~/.coop`. `coop completions zsh` generates dynamic completion by default; the other shells generate static scripts.
+`coop completions <shell>` generates dynamic completion for bash, zsh, fish, PowerShell, and elvish via `clap_complete`. It completes subcommands and flags, and asks coop for live instance, image, and profile names when you press Tab.
 
 ## Generated completion scripts
 
-Generate a script once and drop it where your shell looks for completions.
+Generate a script once and drop it where your shell looks for completions. Loading a saved script does not invoke coop at shell startup; coop runs when completing a command. Regenerate saved scripts after upgrading coop so their completion protocol matches the installed binary.
 
 ### bash
 
@@ -21,7 +21,7 @@ coop completions bash | sudo tee /etc/bash_completion.d/coop > /dev/null
 
 ### zsh
 
-The generated script includes live VM, image, and profile names. The completion file must live on `$fpath`, configured before `compinit`. If you don't already have a directory for it:
+The completion file must live on `$fpath`, configured before `compinit`. If you don't already have a directory for it:
 
 ```sh
 mkdir -p ~/.zfunc
@@ -30,55 +30,56 @@ echo 'autoload -Uz compinit && compinit' >> ~/.zshrc
 coop completions zsh > ~/.zfunc/_coop
 ```
 
-Regenerate `_coop` after upgrading coop so its completion protocol matches the installed binary. Alternatively, generate it on each shell startup by adding this line **after `compinit`** in `~/.zshrc`:
-
-```sh
-source <(coop completions zsh)
-```
-
-If you already use `source <(COMPLETE=zsh coop)`, that continues to work. Only one setup is needed.
-
 ### fish
 
 ```sh
+mkdir -p ~/.config/fish/completions
 coop completions fish > ~/.config/fish/completions/coop.fish
 ```
 
 ### PowerShell
 
 ```powershell
-coop completions powershell | Out-String | Invoke-Expression
+coop completions powershell | Set-Content -Encoding utf8 "$HOME/coop-completion.ps1"
+Add-Content $PROFILE '. "$HOME/coop-completion.ps1"'
 ```
 
-Add the same line to your `$PROFILE` to load it on every shell start.
+The profile line loads the saved script on each shell start. Ensure `$PROFILE` exists before adding the line.
 
 ### elvish
 
 ```sh
+mkdir -p ~/.config/elvish/lib
 coop completions elvish > ~/.config/elvish/lib/coop-completion.elv
 echo 'use coop-completion' >> ~/.config/elvish/rc.elv
 ```
 
 Restart the shell (or `source` your rc) after the first install.
 
-## Dynamic completion
+## Generate on shell startup
 
-Dynamic completion lets `coop` itself compute candidates on TAB — so `coop shell <TAB>` lists your running instances, `coop up --image <TAB>` lists existing images, and `coop setup --profile <TAB>` / `coop up --profile <TAB>` list builtin and custom profiles.
-
-For shells other than zsh, add one line to your shell rc. Zsh's generated script already enables dynamic completion.
+Instead of saving a script, add one of these lines to your shell rc. This runs coop once per shell startup to generate the script, and avoids needing to regenerate a saved file after upgrades. Coop also runs on Tab to compute candidates; it does not start a VM.
 
 ```sh
-# bash
-echo 'source <(COMPLETE=bash coop)' >> ~/.bashrc
+# bash (~/.bashrc)
+source <(coop completions bash)
 
-# fish
-echo 'source (COMPLETE=fish coop | psub)' >> ~/.config/fish/config.fish
+# zsh (~/.zshrc, after compinit)
+source <(coop completions zsh)
 
-# elvish
-echo 'eval (COMPLETE=elvish coop | slurp)' >> ~/.config/elvish/rc.elv
+# fish (~/.config/fish/config.fish)
+coop completions fish | source
+
+# elvish (~/.config/elvish/rc.elv)
+eval (coop completions elvish | slurp)
 ```
 
-Dynamic completion also handles subcommand and flag names. If both static and dynamic scripts are loaded, load the dynamic script last: the most recently registered handler takes precedence.
+```powershell
+# PowerShell ($PROFILE)
+coop completions powershell | Out-String | Invoke-Expression
+```
+
+Existing `COMPLETE=<shell>` setup continues to work; only one setup is needed. Replace older static completion files with newly generated scripts.
 
 ## What completes where
 

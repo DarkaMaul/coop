@@ -682,18 +682,18 @@ Examples:
   # bash — user
   coop completions bash > ~/.local/share/bash-completion/completions/coop
 
-  # zsh — dynamic completion (ensure dir is on $fpath; restart shell)
+  # zsh — user (ensure dir is on $fpath; restart shell)
   coop completions zsh > ~/.zfunc/_coop
 
   # fish — user
   coop completions fish > ~/.config/fish/completions/coop.fish
 
-Zsh scripts include live instance / image / profile names. Regenerate saved
-zsh scripts after upgrading coop. Other shells require one extra line in
-your shell rc for dynamic completion:
+All scripts include live instance / image / profile names. Regenerate saved
+scripts after upgrading coop. Alternatively, generate them on shell startup:
 
-  bash:  source <(COMPLETE=bash coop)
-  fish:  source (COMPLETE=fish coop | psub)
+  bash:  source <(coop completions bash)
+  zsh:   source <(coop completions zsh)  # after compinit
+  fish:  coop completions fish | source
 ";
 
 #[derive(Subcommand)]
@@ -2523,20 +2523,6 @@ token = "test-pat"
         ] {
             let kind = parse_err(args).kind();
             assert_eq!(kind, expected, "unexpected clap error for {args:?}");
-        }
-    }
-
-    #[test]
-    fn completions_emit_static_includes_subcommands() {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut cmd = <super::Cli as clap::CommandFactory>::command();
-        let name = cmd.get_name().to_string();
-        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, &mut buf);
-        let Ok(script) = String::from_utf8(buf) else {
-            panic!("bash completion script is not valid utf-8");
-        };
-        for sub in ["shell", "claude", "destroy", "completions"] {
-            assert!(script.contains(sub), "completion script missing `{sub}`");
         }
     }
 }

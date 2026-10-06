@@ -948,7 +948,7 @@ coop uninstall --yes --purge         # CI: remove binary and data, explicit
 
 ### `completions`
 
-Print a shell completion script. Zsh scripts include dynamic completion of live instance, image, and profile names; regenerate saved zsh scripts after upgrading coop. Other shells generate static scripts and need dynamic completion enabled separately. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
+Print a dynamic shell completion script, including live instance, image, and profile names. Regenerate saved scripts after upgrading coop. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
 
 ```
 coop completions <SHELL>

@@ -7,9 +7,12 @@ three are manual, run when a change warrants them.
 
 ## Integration tests
 
-The generated zsh completion scripts are checked without a VM by
-`cargo test --test zsh_completion` (requires `zsh`, installed in CI). These
-tests cover sourcing and `$fpath` autoloading, including the first Tab request.
+Generated completion is checked without a VM by
+`cargo test --test shell_completion --test zsh_completion`.
+CI runs the generated Bash and zsh
+scripts, including zsh's first Tab after `$fpath` autoloading. All five shells
+have generation and dynamic-protocol checks; fish, elvish, and PowerShell
+interpreters are not required or installed for these checks.
 
 VM integration uses two scripts:
 
