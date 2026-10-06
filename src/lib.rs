@@ -682,17 +682,17 @@ Examples:
   # bash — user
   coop completions bash > ~/.local/share/bash-completion/completions/coop
 
-  # zsh — user (ensure dir is on $fpath; restart shell)
+  # zsh — dynamic completion (ensure dir is on $fpath; restart shell)
   coop completions zsh > ~/.zfunc/_coop
 
   # fish — user
   coop completions fish > ~/.config/fish/completions/coop.fish
 
-Dynamic completion (live instance / image / profile names) requires one
-extra line in your shell rc:
+Zsh scripts include live instance / image / profile names. Regenerate saved
+zsh scripts after upgrading coop. Other shells require one extra line in
+your shell rc for dynamic completion:
 
   bash:  source <(COMPLETE=bash coop)
-  zsh:   source <(COMPLETE=zsh coop)
   fish:  source (COMPLETE=fish coop | psub)
 ";
 
@@ -952,7 +952,7 @@ pub fn run() -> Result<()> {
     }
 
     if let Commands::Completions { shell } = cli.command {
-        completions::emit_static(shell);
+        completions::emit(shell)?;
         return Ok(());
     }
     if matches!(cli.command, Commands::Init) {

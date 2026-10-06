@@ -7,6 +7,10 @@ three are manual, run when a change warrants them.
 
 ## Integration tests
 
+The generated zsh completion scripts are checked without a VM by
+`cargo test --test zsh_completion` (requires `zsh`, installed in CI). These
+tests cover sourcing and `$fpath` autoloading, including the first Tab request.
+
 VM integration uses two scripts:
 
 - `tests/integration.sh` — the test suite. Runs locally, requires `--binary`.

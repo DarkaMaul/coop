@@ -1,8 +1,8 @@
 # Shell completion
 
-`coop` ships with both static and dynamic shell completion via `clap_complete`. Static completion handles subcommand and flag names; dynamic completion additionally fills in live values for instance names, image names, and profile names by reading `~/.coop`.
+`coop` ships with both static and dynamic shell completion via `clap_complete`. Static completion handles subcommand and flag names; dynamic completion additionally fills in live values for instance names, image names, and profile names by reading `~/.coop`. `coop completions zsh` generates dynamic completion by default; the other shells generate static scripts.
 
-## Static completion
+## Generated completion scripts
 
 Generate a script once and drop it where your shell looks for completions.
 
@@ -21,7 +21,7 @@ coop completions bash | sudo tee /etc/bash_completion.d/coop > /dev/null
 
 ### zsh
 
-The completion file must live on `$fpath`. If you don't already have a directory for it:
+The generated script includes live VM, image, and profile names. The completion file must live on `$fpath`, configured before `compinit`. If you don't already have a directory for it:
 
 ```sh
 mkdir -p ~/.zfunc
@@ -29,6 +29,14 @@ echo 'fpath=(~/.zfunc $fpath)' >> ~/.zshrc
 echo 'autoload -Uz compinit && compinit' >> ~/.zshrc
 coop completions zsh > ~/.zfunc/_coop
 ```
+
+Regenerate `_coop` after upgrading coop so its completion protocol matches the installed binary. Alternatively, generate it on each shell startup by adding this line **after `compinit`** in `~/.zshrc`:
+
+```sh
+source <(coop completions zsh)
+```
+
+If you already use `source <(COMPLETE=zsh coop)`, that continues to work. Only one setup is needed.
 
 ### fish
 
@@ -57,14 +65,11 @@ Restart the shell (or `source` your rc) after the first install.
 
 Dynamic completion lets `coop` itself compute candidates on TAB — so `coop shell <TAB>` lists your running instances, `coop up --image <TAB>` lists existing images, and `coop setup --profile <TAB>` / `coop up --profile <TAB>` list builtin and custom profiles.
 
-Add one line to your shell rc:
+For shells other than zsh, add one line to your shell rc. Zsh's generated script already enables dynamic completion.
 
 ```sh
 # bash
 echo 'source <(COMPLETE=bash coop)' >> ~/.bashrc
-
-# zsh
-echo 'source <(COMPLETE=zsh coop)' >> ~/.zshrc
 
 # fish
 echo 'source (COMPLETE=fish coop | psub)' >> ~/.config/fish/config.fish
@@ -73,7 +78,7 @@ echo 'source (COMPLETE=fish coop | psub)' >> ~/.config/fish/config.fish
 echo 'eval (COMPLETE=elvish coop | slurp)' >> ~/.config/elvish/rc.elv
 ```
 
-Dynamic and static completion can coexist — static fills in subcommand and flag names even without `COMPLETE=…` set up.
+Dynamic completion also handles subcommand and flag names. If both static and dynamic scripts are loaded, load the dynamic script last: the most recently registered handler takes precedence.
 
 ## What completes where
 

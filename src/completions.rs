@@ -2,8 +2,8 @@
 //!
 //! Two pieces:
 //!
-//! * Static generation via `coop completions <shell>` — emits a completion
-//!   script the user can source from their shell rc.
+//! * Script generation via `coop completions <shell>` — emits dynamic zsh
+//!   completion and static scripts for the other shells.
 //! * Dynamic completion via `clap_complete::CompleteEnv` — when the binary
 //!   is invoked with `COMPLETE=<shell>`, it computes candidates at runtime
 //!   so things like instance names and image names get real values.
@@ -12,20 +12,35 @@
 //! the binary on every TAB. We swallow all errors and return an empty list
 //! rather than printing diagnostics or panicking.
 
-use std::io;
+use std::io::{self, Write as _};
 
 use clap::CommandFactory as _;
 use clap_complete::engine::CompletionCandidate;
+use clap_complete::env::{EnvCompleter as _, Zsh};
 use clap_complete::{Shell, generate};
 
 use crate::config::{CoopConfig, Instance};
 use crate::guest::BUILTIN_PROFILES;
 
-/// Write a static completion script for `shell` to stdout.
-pub fn emit_static(shell: Shell) {
+/// Write a completion script for `shell` to stdout.
+pub fn emit(shell: Shell) -> io::Result<()> {
     let mut cmd = crate::Cli::command();
     let name = cmd.get_name().to_string();
-    generate(shell, &mut cmd, name, &mut io::stdout());
+    let mut stdout = io::stdout().lock();
+    if shell == Shell::Zsh {
+        // Saved completion files must find the installed binary on PATH,
+        // rather than pinning the path used to generate the file.
+        Zsh.write_registration("COMPLETE", &name, &name, &name, &mut stdout)?;
+        // compinit autoloads this file as _coop on the first TAB. Registration
+        // alone would only make the second TAB work; dispatch the first too.
+        writeln!(
+            stdout,
+            "\nif [[ $funcstack[1] == _{name} ]]; then\n    _clap_dynamic_completer_{name} \"$@\"\nfi"
+        )?;
+    } else {
+        generate(shell, &mut cmd, name, &mut stdout);
+    }
+    Ok(())
 }
 
 /// Candidate list for instance-name arguments.
