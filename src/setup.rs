@@ -44,6 +44,7 @@ pub struct SetupOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExplicitSetupInputSupport {
     Supported,
+    #[cfg(any(target_os = "macos", test))]
     UnsupportedByLima,
 }
 
