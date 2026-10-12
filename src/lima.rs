@@ -1609,8 +1609,9 @@ fn inject_mounts(yaml: &str, mounts: &[crate::config::Mount]) -> Result<String> 
 }
 
 fn compose_template_yaml(cfg: &CoopConfig, provision_script: &str) -> Result<String> {
-    // Shell scripts use LF; reject YAML's other line-break code points as
-    // defense in depth now that serialization no longer depends on line splitting.
+    // Normalize Windows line endings for guest shell compatibility.
+    let provision_script = provision_script.replace("\r\n", "\n");
+    // Reject YAML's other line-break code points as defense in depth.
     if let Some(line_break) = provision_script
         .chars()
         .find(|character| matches!(character, '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'))
@@ -2600,6 +2601,40 @@ mod tests {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
 
         assert_eq!(parsed["provision"][0]["script"].as_str(), Some(script));
+    }
+
+    #[test]
+    fn template_yaml_normalizes_crlf() {
+        let cfg = CoopConfig::default();
+        for script in [
+            "echo one\r\necho two",
+            "#!/bin/bash\r\necho one\n\r\necho two\r\n",
+        ] {
+            let generated = compose_template_yaml(&cfg, script).unwrap();
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
+            assert_eq!(
+                parsed["provision"][0]["script"],
+                script.replace("\r\n", "\n")
+            );
+        }
+    }
+
+    #[test]
+    fn template_yaml_normalizes_profile_post_install_crlf() {
+        let cfg = CoopConfig::default();
+        let profiles = [profile("custom", &[], None, Some("echo one\r\necho two"))];
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &profiles,
+            &GuestUser::default(),
+        );
+        assert!(script.contains("echo one\r\necho two"));
+
+        let generated = compose_template_yaml(&cfg, &script).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
+        let normalized = parsed["provision"][0]["script"].as_str().unwrap();
+        assert!(normalized.contains("echo one\necho two\n"));
+        assert!(!normalized.contains('\r'));
     }
 
     #[test]
