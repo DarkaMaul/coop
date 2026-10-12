@@ -52,8 +52,14 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
-      - name: Install network test tools
-        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux openssh-client openssh-server
+      - name: Install integration test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iptables iputils-ping jq rsync util-linux \
+            openssh-client openssh-server
+
+      - name: Guest-file copy regression tests
+        run: bash tests/guest-files-copy.sh
 
       - name: Release preflight regression tests
         run: python3 tests/test-preflight-release.py
@@ -63,6 +69,9 @@ jobs:
 
       - name: Codex account wrapper regression tests
         run: python3 tests/test-codex-account.py
+
+      - name: Linux unit runner regression tests
+        run: python3 tests/test-linux-unit-runner.py
 
       - name: Integration test — proxy reverse forwarding
         run: ./tests/integration-proxy-forward.sh
