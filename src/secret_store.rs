@@ -563,12 +563,16 @@ fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Resul
         .arg(&title)
         .output();
     let credential_field = format!("credential={token}");
+    // A failed config/override write leaves the previous lookup in place.
+    // Keep legacy `--fields password` commands working after replacement too.
+    let password_field = format!("password[password]={token}");
     Cmd::new("op")
         .arg("item")
         .arg("create")
         .arg("--category=API Credential")
         .arg(format!("--title={title}"))
         .redacted_arg(credential_field)
+        .redacted_arg(password_field)
         .run()
         .context("Failed to create 1Password item")?;
     Ok(CmdToken::OnePassword {
@@ -922,19 +926,34 @@ mod tests {
                 (ANTHROPIC_SERVICE, "anthropic"),
                 (OPENAI_SERVICE, "openai"),
             ] {
-                let stored = store_secret(
-                    Backend::OnePassword,
-                    service,
-                    &AccountName::new(name).unwrap(),
-                    "test-api-token",
-                    Path::new(&root),
-                )
-                .unwrap();
-                assert_eq!(CmdToken::parse(&stored.to_string()), Some(stored.clone()));
-                assert_eq!(
-                    crate::config::resolve_cmd_value(&stored.to_string()).unwrap(),
-                    "test-api-token"
-                );
+                // Leave the legacy command unchanged, as happens when saving the
+                // replacement command to config.toml or proxy.json fails.
+                let saved = CmdToken::OnePassword {
+                    title: format!("{service} ({name})"),
+                    field: OnePasswordField::Password,
+                }
+                .to_string();
+                for token in ["first-api-token", "rotated-api-token"] {
+                    let stored = store_secret(
+                        Backend::OnePassword,
+                        service,
+                        &AccountName::new(name).unwrap(),
+                        token,
+                        Path::new(&root),
+                    )
+                    .unwrap();
+                    assert_eq!(CmdToken::parse(&stored.to_string()), Some(stored.clone()));
+                    assert!(matches!(
+                        stored,
+                        CmdToken::OnePassword {
+                            field: OnePasswordField::Credential,
+                            ..
+                        }
+                    ));
+                    for command in [&saved, &stored.to_string()] {
+                        assert_eq!(crate::config::resolve_cmd_value(command).unwrap(), token);
+                    }
+                }
             }
             return;
         }
@@ -948,17 +967,29 @@ mod tests {
             r#"#!/bin/sh
 [ "$1" = item ] || exit 1
 case "$2" in
-    delete) exit 0 ;;
+    delete)
+        # Archiving removes both fields from the active item.
+        printf '' > "$COOP_TEST_ONEPASSWORD_ROOT/password"
+        printf '' > "$COOP_TEST_ONEPASSWORD_ROOT/credential"
+        ;;
     create)
-        [ "$#" = 5 ] || exit 2
+        [ "$#" = 6 ] || exit 2
         [ "$3" = '--category=API Credential' ] || exit 3
-        [ "$5" = 'credential=test-api-token' ] || exit 4
+        case "$5" in credential=*) ;; *) exit 4 ;; esac
+        case "$6" in 'password[password]='*) ;; *) exit 4 ;; esac
+        printf '%s\n' "${5#*=}" > "$COOP_TEST_ONEPASSWORD_ROOT/credential"
+        printf '%s\n' "${6#*=}" > "$COOP_TEST_ONEPASSWORD_ROOT/password"
+        printf '%s\n' "${4#--title=}" > "$COOP_TEST_ONEPASSWORD_ROOT/title"
         printf '%s\n' "$4" >> "$COOP_TEST_ONEPASSWORD_ROOT/created"
         ;;
     get)
         [ "$#" = 6 ] || exit 5
-        [ "$4" = --fields ] && [ "$5" = credential ] && [ "$6" = --reveal ] || exit 6
-        printf '%s\n' test-api-token
+        [ "$4" = --fields ] && [ "$6" = --reveal ] || exit 6
+        read -r title < "$COOP_TEST_ONEPASSWORD_ROOT/title"
+        [ "$3" = "$title" ] || exit 6
+        case "$5" in password|credential) ;; *) exit 6 ;; esac
+        read -r token < "$COOP_TEST_ONEPASSWORD_ROOT/$5" || exit 6
+        printf '%s\n' "$token"
         ;;
     *) exit 7 ;;
 esac
@@ -984,7 +1015,10 @@ esac
         assert_eq!(
             std::fs::read_to_string(root.path().join("created")).unwrap(),
             "--title=coop-github-pat (owner-repo)\n\
+             --title=coop-github-pat (owner-repo)\n\
              --title=coop-anthropic (anthropic)\n\
+             --title=coop-anthropic (anthropic)\n\
+             --title=coop-openai (openai)\n\
              --title=coop-openai (openai)\n"
         );
     }

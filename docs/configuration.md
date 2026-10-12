@@ -237,7 +237,9 @@ token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields c
 The 1Password wizard creates **API Credential** items and stores the token in
 the `credential` field. Existing **Login** items with `--fields password`
 retrieval commands remain supported. Rotating a token creates an API Credential
-replacement and updates its saved retrieval command.
+replacement and updates its saved retrieval command. The replacement also keeps
+a concealed `password` field so the previous lookup still works if saving the
+new retrieval command fails.
 
 Other subcommands:
 
