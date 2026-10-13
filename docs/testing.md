@@ -125,6 +125,13 @@ Lifecycle and guest-visible changes still require both real backends:
 
 ## Integration tests
 
+Generated completion is checked without a VM by
+`cargo test --test shell_completion --test zsh_completion`.
+CI runs the generated Bash and zsh
+scripts, including zsh's first Tab after `$fpath` autoloading. All five shells
+have generation and dynamic-protocol checks; fish, elvish, and PowerShell
+interpreters are not required or installed for these checks.
+
 VM integration uses two scripts:
 
 - `tests/integration.sh` — the test suite. Runs locally, requires `--binary`.
