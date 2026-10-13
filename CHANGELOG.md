@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- Store new 1Password GitHub PATs and proxy credentials as API Credential items
+  instead of Login items. Existing Login retrieval commands remain supported;
+  rotating a token or rerunning proxy setup creates an API Credential replacement
+  with a concealed `password` compatibility field, so the previous lookup still
+  works if saving the new retrieval command fails.
+
 ## v0.8.0
 
 ### Security
