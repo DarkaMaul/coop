@@ -680,6 +680,10 @@ pub fn open_editor(
     };
 
     write_ssh_config(running)?;
+    tracing::warn!(
+        "Connecting a host editor to the VM may allow a compromised guest to execute commands \
+on your host. Only connect to guests you trust."
+    );
     launch_editor(inst, &remote_path, editor)?;
     Ok(())
 }
