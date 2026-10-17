@@ -295,8 +295,8 @@ static, explicitly rotated credentials using workspace Codex entitlements;
 see [the credential proxy guide](../credential-proxy.md). They are distinct
 from cached ChatGPT OAuth sessions and legacy agent-identity JWTs.
 
-The spike in §11.1 is resolved. The key result: **for every path except Codex
-subscription, the proxy holds a *static, long-lived* credential and injects it —
+The spike in §11.1 is resolved. The key result: **for every path except cached Codex
+OAuth sessions, the proxy holds a *static, long-lived* credential and injects it —
 there is no OAuth-refresh logic to write.** That is the security win, and it comes
 from vendor-official mechanisms, not reverse engineering.
 

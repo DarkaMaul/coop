@@ -96,11 +96,18 @@ fn x_api_key() -> HeaderName {
     HeaderName::from_static("x-api-key")
 }
 
+// Only unit tests can replace the TLS transport after request preparation.
+#[cfg(test)]
+type TestBackend =
+    fn(Request<Incoming>) -> Pin<Box<dyn std::future::Future<Output = Response<ProxyBody>> + Send>>;
+
 /// Shared, cheaply-cloneable per-connection state.
 #[derive(Clone)]
 struct Ctx {
     cfg: Arc<ProxyConfig>,
     connector: TlsConnector,
+    #[cfg(test)]
+    test_backend: Option<TestBackend>,
     permits: Arc<Semaphore>,
     connections: Arc<Semaphore>,
 }
@@ -111,6 +118,8 @@ impl Ctx {
         Ok(Self {
             cfg: Arc::new(cfg),
             connector,
+            #[cfg(test)]
+            test_backend: None,
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         })
@@ -280,6 +289,17 @@ async fn forward(
     ctx: &Ctx,
     permit: OwnedSemaphorePermit,
 ) -> Result<Response<ProxyBody>, Refusal> {
+    #[cfg(test)]
+    if let Some(backend) = ctx.test_backend {
+        return Ok(backend(req).await.map(|body| {
+            GuardedBody {
+                inner: body,
+                _permit: permit,
+            }
+            .boxed()
+        }));
+    }
+
     let host = ctx.cfg.upstream_host.as_str();
     let server_name = ServerName::try_from(host.to_owned()).map_err(|_| Refusal {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -592,6 +612,78 @@ mod tests {
         .await
         .expect("disconnect must release connection capacity");
         let _ = stop.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_codex_request_is_forwarded_with_host_identity() {
+        let cfg = ProxyConfig::from_json(
+            r#"{
+            "listen": "127.0.0.1:0",
+            "capability_token": "guest-capability",
+            "upstream_host": "chatgpt.com",
+            "injection": { "scheme": "codex_access_token", "credential": "at-host-only",
+                "account_id": "host-workspace", "is_fedramp": true }
+        }"#,
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(cfg).unwrap();
+        ctx.test_backend = Some(|req| {
+            Box::pin(async move {
+                assert_eq!(req.method(), Method::POST);
+                assert_eq!(req.uri(), "/backend-api/codex/responses");
+                let headers = req.headers();
+                assert_eq!(headers[HOST], "chatgpt.com");
+                assert_eq!(headers[AUTHORIZATION], "Bearer at-host-only");
+                assert_eq!(headers["chatgpt-account-id"], "host-workspace");
+                assert_eq!(headers["x-openai-fedramp"], "true");
+                assert!(!headers.contains_key("x-openai-actor-authorization"));
+                assert!(!headers.contains_key("x-api-key"));
+                assert_eq!(
+                    req.into_body().collect().await.unwrap().to_bytes(),
+                    "{\"input\":\"hello\"}"
+                );
+                Response::new(
+                    Full::new(Bytes::from_static(b"canned Codex response"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+            })
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(accept_loop(ctx, listener, async {
+            let _ = stopped.await;
+        }));
+        timeout(Duration::from_secs(5), async {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            let connection = tokio::spawn(connection);
+            let req = Request::post("/v1/responses")
+                .header(HOST, "guest.invalid")
+                .header(AUTHORIZATION, "Bearer guest-capability")
+                .header("x-api-key", "guest-key")
+                .header("chatgpt-account-id", "guest-workspace")
+                .header("x-openai-fedramp", "false")
+                .header("x-openai-actor-authorization", "guest-actor")
+                .body(Full::new(Bytes::from_static(b"{\"input\":\"hello\"}")))
+                .unwrap();
+            let response = sender.send_request(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "canned Codex response"
+            );
+            drop(sender);
+            connection.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
         server.await.unwrap();
     }
 

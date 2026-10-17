@@ -186,6 +186,17 @@ mod tests {
     }
 
     #[test]
+    fn workspace_id_length_boundary() {
+        for (len, accepted) in [(256, true), (257, false)] {
+            let body = format!(
+                r#"{{"chatgpt_account_id":"{}","chatgpt_account_is_fedramp":false}}"#,
+                "a".repeat(len)
+            );
+            assert_eq!(parse_metadata(&body).is_ok(), accepted, "length {len}");
+        }
+    }
+
+    #[test]
     fn metadata_request_is_fixed_bounded_and_does_not_follow_redirects() {
         let command = metadata_command().build();
         let args: Vec<_> = command
@@ -193,6 +204,7 @@ mod tests {
             .map(|arg| arg.to_str().unwrap())
             .collect();
         assert_eq!(args[0], "--disable");
+        assert!(args.contains(&"--fail"));
         assert!(args.windows(2).any(|p| p == ["--url", WHOAMI_URL]));
         assert!(args.windows(2).any(|p| p == ["--header", "@-"]));
         assert!(args.windows(2).any(|p| p == ["--proto", "=https"]));

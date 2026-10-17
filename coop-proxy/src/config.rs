@@ -170,6 +170,15 @@ mod tests {
         let valid = codex_config();
         let cfg = ProxyConfig::from_json(&valid.to_string()).unwrap();
         assert!(!format!("{cfg:?}").contains("at-private"));
+        for (len, accepted) in [(256, true), (257, false)] {
+            let mut boundary = valid.clone();
+            boundary["injection"]["account_id"] = "a".repeat(len).into();
+            assert_eq!(
+                ProxyConfig::from_json(&boundary.to_string()).is_ok(),
+                accepted,
+                "length {len}"
+            );
+        }
         for (key, value) in [
             ("account_id", ""),
             ("account_id", "workspace\r\nsecret"),

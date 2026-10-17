@@ -1802,9 +1802,9 @@ pub struct ProxyConfig {
 /// A single proxied upstream: the real credential and how to inject it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyUpstream {
-    /// The real credential (an API key, Claude `setup-token`, or Codex access token), a plain
-    /// value or a `cmd:` indirection resolved via [`resolve_cmd_value`] at
-    /// proxy start — never written to disk, never forwarded into the guest.
+    /// The real credential (an API key, Claude `setup-token`, or Codex access token), either
+    /// stored directly in the configuration file or provided through a `cmd:` indirection
+    /// resolved via [`resolve_cmd_value`] at proxy start. It is never forwarded into the guest.
     pub credential: Secret<String>,
 
     /// How the proxy authenticates upstream. Defaults to `api_key`
