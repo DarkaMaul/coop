@@ -442,6 +442,7 @@ mod tests {
     #[test]
     fn setup_persists_codex_token_mode_for_defaults_and_vm_overrides() {
         let dir = tempfile::tempdir().unwrap();
+        crate::fs_util::private_dir(dir.path()).unwrap();
         let path = config_at(dir.path(), "ssh_port = 2222\n");
         upsert_proxy_entry(
             &path,
