@@ -181,7 +181,7 @@ generates.
 | Point at proxy | `ANTHROPIC_BASE_URL` in managed `settings.json` (`claude_env_block`) | `[model_providers.coop].base_url` in `~/.codex/config.toml` (`codex_local_config`) |
 | Guest-held credential | per-instance capability token in `ANTHROPIC_AUTH_TOKEN` | per-instance capability token via `env_key = "COOP_LOCAL_API_KEY"`, sent as `Authorization: Bearer` |
 | Wire protocol | Messages API + SSE + tool-use round-trips | Responses API (`wire_api = "responses"`) + SSE |
-| Proxy injects upstream | real key → `Authorization`/`x-api-key` → `api.anthropic.com` | real key → `Authorization: Bearer` → `api.openai.com` |
+| Proxy injects upstream | real key → `Authorization`/`x-api-key` → `api.anthropic.com` | Platform API key → `Authorization: Bearer` → `api.openai.com`; workspace PAT → Bearer + workspace headers → `chatgpt.com` |
 
 Two facts from the Codex docs make this work and are worth pinning:
 
@@ -220,9 +220,9 @@ exists). The proxy is the only shared new component.
 - **Guest→proxy hop:** plain HTTP over the private host-guest link. No TLS, no CA.
   The link is already private; #2's "no route out" can make it the *only* link.
 - **Proxy→upstream hop:** normal outbound HTTPS to the pinned upstream
-  (`api.anthropic.com` / `api.openai.com`), with the real credential injected as
-  the upstream's expected header. The upstream host is fixed per route, not taken
-  from the guest — so the guest cannot retarget the injected key at an
+  (`api.anthropic.com` / `api.openai.com` / `chatgpt.com`), with the real
+  credential injected as the upstream's expected header. The upstream host is
+  fixed per route, not taken from the guest — so the guest cannot retarget the injected key at an
   attacker-controlled host.
 - **Streaming:** must stream request and response bodies (SSE, tool-use
   round-trips) rather than buffer — a hard requirement for both agents. A mature
@@ -327,9 +327,12 @@ from vendor-official mechanisms, not reverse engineering.
 **The `auth.json` exposure, closed in v1.** coop copies `~/.codex/auth.json` onto
 the guest disk today (`backend.rs:2326`) — a refreshable token at rest, the worst
 case #411 names. When proxy mode is on, **stop staging `auth.json`** (drop it from
-the effective `CODEX_ALLOWED_FILES` for that instance). A user who wants Codex
-subscription billing opts out of proxy mode explicitly and accepts the
-disk-resident token — a documented, deliberate trade, not a silent one.
+the effective `CODEX_ALLOWED_FILES` for that instance). Platform API keys and
+workspace PATs both keep the real credential on the host in proxy mode; PATs
+use workspace Codex entitlements without a cached OAuth session. A user who
+chooses interactive ChatGPT OAuth login instead opts out of proxy mode and
+accepts persistent guest credentials (the managed `[codex] auth = "chatgpt"`
+mode uses the guest keyring; see [the trust model](../trust-model.md)).
 
 **On `apiKeyHelper` (Claude) as an alternative — and why it is not one.** Claude
 Code documents `apiKeyHelper`, a guest-side script it calls to fetch a token
@@ -698,7 +701,8 @@ If any of these fails, the mechanism changes before anything else is built.
   host nor scheme; only the path is forwarded to the pinned host. Closes SSRF.
 - **TLS verification is correct and cannot regress.** Verify the upstream cert
   against the pinned `webpki-roots`; a bug that disables verification MITMs the real
-  key. Consider pinning the two upstreams. Add a test that a bad cert is rejected.
+  key. Consider certificate pinning for the fixed upstreams. Add a test that a bad
+  cert is rejected.
 - **Fail closed.** If `cmd:` secret resolution fails at proxy start, the VM does
   not come up in a state where the agent silently has no or wrong credentials —
   clear error, no fallback to a raw-key path.
@@ -765,9 +769,11 @@ real caveat, and all VZ-driver-specific and needing a spike shared with #2's mac
 networking work:
 
 - **Jail the proxy with Seatbelt (`sandbox-exec`).** A profile confining
-  `coop-proxy` to: no filesystem writes, `connect` only to the two upstream
-  hosts:443, `bind` only its one listener, no `exec`. The sandbox inherits to
-  children and cannot be removed from inside — the macOS analog of the Linux
+  `coop-proxy` to: no filesystem writes, outbound HTTPS (`:443`) and DNS (`:53`),
+  loopback listening, and execution restricted to the proxy binary. Egress is
+  port-scoped; the proxy's fixed hosts and TLS verification enforce upstream
+  identity. The sandbox inherits to children and cannot be removed from inside
+  — the macOS analog of the Linux
   netns/uid jail, and close to it in strength. **Caveat:** `sandbox-exec` is
   officially deprecated (still functional and widely used — Chromium, agent
   harnesses — and Apple has shipped no clean CLI successor), so it is a pragmatic

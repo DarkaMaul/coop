@@ -1045,7 +1045,7 @@ for precedence, opt-out, conflicts, rotation, and bootstrap timing.
 Manage the host-side credential-injecting proxy. When a `[proxy.<provider>]`
 upstream is configured, coop runs a `coop-proxy` process on the host for the
 lifetime of each remote-mode VM: the guest is pointed at the proxy and holds
-only a per-instance capability token, while the real API key stays on the host
+only a per-instance capability token, while the real credential stays on the host
 and is injected onto outbound requests the guest never sees. Applies only in
 remote model mode (`coop model <vm> remote`); local mode takes precedence. See
 the [credential proxy guide](credential-proxy.md) and the

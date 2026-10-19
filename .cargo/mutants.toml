@@ -403,6 +403,9 @@ exclude_re = [
   # those is a real gap. File-anchored so the generic `start`/`stop` names don't
   # scope out same-named functions elsewhere.
   "src/proxy\\.rs:.*\\bstart_provider\\b",
+  # Startup composition keeps real cleanup/resolution; injected metadata and
+  # process boundaries have focused regression and deliberate-mutation tests.
+  "src/proxy\\.rs:.*\\bstart_provider_with\\b",
   "src/proxy\\.rs:.*\\bstop\\b",
   "src/proxy\\.rs:.*\\bstop_provider\\b",
   "src/proxy\\.rs:.*\\bkill_pid_file\\b",

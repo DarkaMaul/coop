@@ -255,10 +255,10 @@ pub fn codex_local_config(base_url: &str, model: &str) -> toml::Table {
 /// injecting the real credential upstream.
 ///
 /// The `base_url` gets an `/v1` suffix: Codex forms the request URL as
-/// `{base_url}/responses`, and the proxy forwards the path verbatim to
-/// `api.openai.com`, so the guest must produce `/v1/responses` (`OpenAI`'s
-/// Responses endpoint) — mirroring `OpenAI`'s own `https://api.openai.com/v1`
-/// provider base.
+/// `{base_url}/responses`, so the guest must produce `/v1/responses` in both
+/// auth modes. The proxy forwards that path verbatim to `api.openai.com` for
+/// Platform API keys, or translates it to `/backend-api/codex/responses` at
+/// `chatgpt.com` for workspace PATs.
 pub fn codex_proxy_config(base_url: &str) -> toml::Table {
     let mut provider = toml::Table::new();
     provider.insert(

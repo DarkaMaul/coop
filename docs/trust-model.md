@@ -252,8 +252,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   the workspace ID and FedRAMP routing flag are retained from the metadata
   response; malformed metadata fails closed without echoing the response.
   The proxy pins `chatgpt.com`, translates only the allowed Responses creation
-  operation to `/backend-api/codex/responses`, and replaces guest-supplied
-  workspace, actor-authorization, and FedRAMP headers. Both `OPENAI_API_KEY`
+  operation to `/backend-api/codex/responses`, reconstructs the workspace and
+  FedRAMP headers from host-validated metadata, and strips guest-supplied
+  actor authorization. Both `OPENAI_API_KEY`
   and `CODEX_ACCESS_TOKEN` are suppressed from managed guest forwarding in
   OpenAI proxy mode. Cached OAuth tokens and legacy agent-identity JWTs are
   unsupported; there is no refresh or API-key fallback. Token rotation takes

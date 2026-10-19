@@ -61,7 +61,7 @@ const PROXY_READY_GRACE: Duration = Duration::from_secs(5);
 pub enum Provider {
     /// Anthropic (Claude Code) → `api.anthropic.com`.
     Anthropic,
-    /// `OpenAI` (Codex) → `api.openai.com`.
+    /// `OpenAI` (Codex) → `api.openai.com`, or `chatgpt.com` for workspace PATs.
     Openai,
 }
 
@@ -77,8 +77,8 @@ impl Provider {
         }
     }
 
-    /// The fixed upstream host. The guest cannot influence this — only the
-    /// request path is forwarded (closes SSRF).
+    /// The default fixed upstream. Workspace PAT startup selects `chatgpt.com`
+    /// instead; neither destination is guest-controlled (closes SSRF).
     fn upstream_host(self) -> &'static str {
         match self {
             Provider::Anthropic => "api.anthropic.com",
@@ -140,7 +140,29 @@ pub fn start_provider(
     upstream: &ProxyUpstream,
     target: &SshTarget,
 ) -> Result<ProxyHandle> {
+    start_provider_with(
+        inst,
+        provider,
+        upstream,
+        crate::codex_token::load_metadata,
+        |listen, json| spawn_proxy(inst, provider.name(), listen, json),
+        |port| spawn_reverse_forward(inst, provider.name(), target, port),
+    )
+}
+
+// Keep startup composition shared while tests replace only external metadata
+// and process boundaries; credential resolution and state cleanup stay real.
+fn start_provider_with(
+    inst: &Instance,
+    provider: Provider,
+    upstream: &ProxyUpstream,
+    load_metadata: impl FnOnce(&str) -> Result<CodexTokenMetadata>,
+    launch_proxy: impl FnOnce(SocketAddr, &str) -> Result<()>,
+    launch_tunnel: impl FnOnce(u16) -> Result<()>,
+) -> Result<ProxyHandle> {
     ensure_auth_supported(provider, upstream.auth)?;
+    // A failed replacement must not leave the previous credential usable.
+    stop_provider(inst, provider);
     let credential = resolve_cmd_value(upstream.credential.expose()).with_context(|| {
         format!(
             "Failed to resolve the {} proxy credential — aborting VM start (fail-closed); \
@@ -150,7 +172,7 @@ pub fn start_provider(
     })?;
 
     let metadata = if upstream.auth == ProxyAuthScheme::CodexAccessToken {
-        Some(crate::codex_token::load_metadata(&credential)?)
+        Some(load_metadata(&credential)?)
     } else {
         None
     };
@@ -170,7 +192,7 @@ pub fn start_provider(
         metadata.as_ref(),
     )?;
 
-    spawn_proxy(inst, provider.name(), listen, &json)?;
+    launch_proxy(listen, &json)?;
     // Persist the capability token for providers that forward it via env on
     // later sessions (Codex); Claude reads its token from the returned handle
     // (settings.json) and keeps it out of host disk. Written after spawn so a
@@ -183,7 +205,7 @@ pub fn start_provider(
     }
     // Expose the loopback proxy into the guest. If the tunnel fails, tear the
     // proxy back down so we don't leave it orphaned (fail closed).
-    if let Err(e) = spawn_reverse_forward(inst, provider.name(), target, port) {
+    if let Err(e) = launch_tunnel(port) {
         stop_provider(inst, provider);
         return Err(e);
     }
@@ -794,7 +816,9 @@ mod tests {
             key_path: tmp.path().join("unused_key"),
             host_tools: crate::config::CoopConfig::default().ssh.host_tools,
         };
+        let mut stale = StaleProvider::seed(&inst);
         let error = start_provider(&inst, Provider::Openai, &upstream, &target).unwrap_err();
+        stale.assert_stopped(&inst);
         assert!(
             error
                 .to_string()
@@ -802,6 +826,154 @@ mod tests {
         );
         assert!(!format!("{error:#}").contains("sk-wrong-type"));
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    struct StaleProvider {
+        children: [std::process::Child; 2],
+    }
+
+    impl StaleProvider {
+        fn seed(inst: &Instance) -> Self {
+            let children = [
+                Command::new("sleep").arg("30").spawn().unwrap(),
+                Command::new("sleep").arg("30").spawn().unwrap(),
+            ];
+            for (path, child) in [pid_path(inst, "openai"), fwd_pid_path(inst, "openai")]
+                .iter()
+                .zip(&children)
+            {
+                fs::write(path, child.id().to_string()).unwrap();
+            }
+            write_token_file(inst, Provider::Openai, "stale-capability").unwrap();
+            Self { children }
+        }
+
+        fn assert_stopped(&mut self, inst: &Instance) {
+            for path in [
+                pid_path(inst, "openai"),
+                fwd_pid_path(inst, "openai"),
+                token_path(inst, "openai"),
+            ] {
+                assert!(!path.exists(), "stale state remains: {}", path.display());
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for child in &mut self.children {
+                while child.try_wait().unwrap().is_none() {
+                    assert!(Instant::now() < deadline, "stale process still running");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    impl Drop for StaleProvider {
+        fn drop(&mut self) {
+            // Also clean up if a deliberate regression makes an assertion fail.
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn failed_codex_start_clears_previous_provider_state() {
+        use std::cell::Cell;
+
+        for credential in ["cmd:exit 7", "at-test"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut inst = inst_with_index(0);
+            inst.dir = tmp.path().to_path_buf();
+            let mut stale = StaleProvider::seed(&inst);
+            let upstream = ProxyUpstream {
+                credential: Secret::new(credential.to_string()),
+                auth: ProxyAuthScheme::CodexAccessToken,
+            };
+            let metadata_called = Cell::new(false);
+            let processes_started = Cell::new(0);
+            let error = start_provider_with(
+                &inst,
+                Provider::Openai,
+                &upstream,
+                |token| {
+                    metadata_called.set(true);
+                    assert_eq!(token, "at-test");
+                    // Cleanup must already have happened before the lookup.
+                    stale.assert_stopped(&inst);
+                    bail!("metadata lookup failed")
+                },
+                |_, _| {
+                    processes_started.set(processes_started.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    processes_started.set(processes_started.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(metadata_called.get(), credential == "at-test");
+            if metadata_called.get() {
+                assert_eq!(error.to_string(), "metadata lookup failed");
+            } else {
+                assert!(error.to_string().contains("Failed to resolve"));
+            }
+            assert_eq!(processes_started.get(), 0);
+            stale.assert_stopped(&inst);
+        }
+    }
+
+    #[test]
+    fn codex_start_selects_metadata_upstream_and_persists_capability() {
+        use std::cell::{Cell, RefCell};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inst = inst_with_index(3);
+        inst.dir = tmp.path().to_path_buf();
+        let upstream = ProxyUpstream {
+            credential: Secret::new("cmd:printf at-test".to_string()),
+            auth: ProxyAuthScheme::CodexAccessToken,
+        };
+        let captured = RefCell::new(None);
+        let tunnel_started = Cell::new(false);
+        let handle = start_provider_with(
+            &inst,
+            Provider::Openai,
+            &upstream,
+            |token| {
+                assert_eq!(token, "at-test");
+                Ok(CodexTokenMetadata {
+                    chatgpt_account_id: "workspace-test".to_string(),
+                    chatgpt_account_is_fedramp: true,
+                })
+            },
+            |listen, json| {
+                assert_eq!(listen, "127.0.0.1:9791".parse::<SocketAddr>().unwrap());
+                let config: serde_json::Value = serde_json::from_str(json).unwrap();
+                assert_eq!(config["listen"], listen.to_string());
+                assert_eq!(config["upstream_host"], "chatgpt.com");
+                assert_eq!(config["injection"]["scheme"], "codex_access_token");
+                assert_eq!(config["injection"]["credential"], "at-test");
+                assert_eq!(config["injection"]["account_id"], "workspace-test");
+                assert_eq!(config["injection"]["is_fedramp"], true);
+                *captured.borrow_mut() = Some(config);
+                Ok(())
+            },
+            |port| {
+                assert_eq!(port, 9791);
+                assert!(captured.borrow().is_some());
+                assert!(read_capability_token(&inst, Provider::Openai).is_some());
+                tunnel_started.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(tunnel_started.get());
+        assert_eq!(handle.base_url, "http://127.0.0.1:9791");
+        let token = read_capability_token(&inst, Provider::Openai).unwrap();
+        assert_eq!(&token, handle.capability_token.expose());
+        assert_eq!(token.len(), 64);
+        assert_eq!(captured.into_inner().unwrap()["capability_token"], token);
     }
 
     #[test]
