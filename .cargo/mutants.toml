@@ -403,6 +403,9 @@ exclude_re = [
   # those is a real gap. File-anchored so the generic `start`/`stop` names don't
   # scope out same-named functions elsewhere.
   "src/proxy\\.rs:.*\\bstart_provider\\b",
+  # Startup composition keeps real cleanup/resolution; injected metadata and
+  # process boundaries have focused regression and deliberate-mutation tests.
+  "src/proxy\\.rs:.*\\bstart_provider_with\\b",
   "src/proxy\\.rs:.*\\bstop\\b",
   "src/proxy\\.rs:.*\\bstop_provider\\b",
   "src/proxy\\.rs:.*\\bkill_pid_file\\b",
@@ -423,6 +426,10 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bconfined_command\\b",
   "src/proxy\\.rs:.*\\bwrite_token_file\\b",
   "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
+  # Codex PAT metadata lookup performs a bounded HTTPS curl request. Its
+  # token/metadata parsers and fixed command construction remain in scope.
+  "src/codex_token\\.rs:.*\\bload_metadata\\b",
+  "src/codex_token\\.rs:.*\\bload_metadata_with_command\\b",
   "src/proxy\\.rs:.*\\bpid_path\\b",
   "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
   "src/proxy\\.rs:.*\\btoken_path\\b",
