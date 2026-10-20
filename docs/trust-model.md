@@ -238,12 +238,28 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   Codex via the `coop_local` provider's bearer `env_key`). In proxy mode Codex's
   `~/.codex/auth.json` is also **not** staged onto the guest disk (it holds a
   refreshable subscription token). Each credential is resolved on the host and
-  handed to `coop-proxy` over **stdin**, never argv or disk; a resolution failure
-  fails the boot closed. A per-VM override
+  handed to `coop-proxy` over **stdin**, never argv or a transport file. Literal
+  credentials are persisted in host configuration; `cmd:` indirections resolve
+  them at startup. A resolution failure fails the boot closed. A per-VM override
   (`proxy_state.rs`, `<inst.dir>/proxy.json`) selects a different host-side
   credential for one VM — resolution is override → default → off — without
   changing the proxy binary or the capability token. See
   [`credential-proxy.md`](credential-proxy.md).
+- **Codex access-token proxy auth stays on the host.** With `[proxy.openai]
+  auth = "codex_access_token"`, coop validates a Codex workspace PAT (`at-...`)
+  through a fixed, bounded HTTPS lookup at `auth.openai.com` before starting
+  the proxy. The token goes to curl and the proxy on stdin, never argv. Only
+  the workspace ID and FedRAMP routing flag are retained from the metadata
+  response; malformed metadata fails closed without echoing the response.
+  The proxy pins `chatgpt.com`, translates only the allowed Responses creation
+  operation to `/backend-api/codex/responses`, reconstructs the workspace and
+  FedRAMP headers from host-validated metadata, and strips guest-supplied
+  actor authorization. Both `OPENAI_API_KEY`
+  and `CODEX_ACCESS_TOKEN` are suppressed from managed guest forwarding in
+  OpenAI proxy mode. Cached OAuth tokens and legacy agent-identity JWTs are
+  unsupported; there is no refresh or API-key fallback. Token rotation takes
+  effect on VM restart. The guest's capability still authorizes inference
+  using the token creator's workspace entitlements; it is not a usage budget.
 - **Codex ChatGPT account auth is persistent guest state.** With
   `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
   process env, `env_forward`, and persisted `--env` overlays, writes
@@ -380,8 +396,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   reachable by exactly one guest, identically on both backends. It is guarded
   by a per-instance capability token and forwards only its documented
   provider-specific operations to a fixed per-provider upstream
-  (`api.anthropic.com` / `api.openai.com`), never a guest-supplied host — one
-  proxy process and one tunnel per (VM, provider). Its own TLS-verifying
+  (`api.anthropic.com` / `api.openai.com` / `chatgpt.com`), never a
+  guest-supplied host — one proxy process and one tunnel per (VM, provider). Its own TLS-verifying
   outbound HTTPS is the intended egress; a change that lets the guest influence
   the upstream host, widens the operation policy without security review, or
   binds anything wider than loopback, is a finding. The proxy streams allowed
@@ -415,7 +431,7 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   flag a change that *widens* them):
   - **Port-scoped, not host-scoped.** Both Landlock and Seatbelt filter by
     port, not hostname/IP. A *fully compromised* proxy could still open a TCP
-    connection to some other host on `:443`; the two upstreams' identity is
+    connection to some other host on `:443`; the fixed upstreams' identity is
     enforced one layer up, at the proxy's TLS verification + pinned `Host`, and
     the guest still cannot retarget them. Host-scoped egress would need IP
     pinning (fragile against CDN rotation) or an L7 egress proxy — out of scope
