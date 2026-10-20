@@ -1504,19 +1504,7 @@ mod tests {
             symlink("../nested", source.join("links").join(name)).unwrap();
             fs::write(source.join(format!("{name}.txt")), "near miss").unwrap();
         }
-        let mut target = fake_ssh_target();
-        let rsync_path = Command::new("sh")
-            .args(["-c", "command -v rsync"])
-            .output()
-            .unwrap();
-        assert!(rsync_path.status.success(), "test requires installed rsync");
-        let rsync_path = String::from_utf8(rsync_path.stdout).unwrap();
-        target.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
-            None,
-            None,
-            Some(Path::new(rsync_path.trim())),
-        )
-        .unwrap();
+        let target = fake_ssh_target();
         let status = target
             .rsync_command()
             .unwrap()

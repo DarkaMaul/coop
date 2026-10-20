@@ -95,7 +95,8 @@ code, it must hold for **both** backends. Known intentional divergences:
 | `guest_host_address` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
 | `mounts_are_live` | `false` (one-time rsync sync) | `true` (virtiofs) |
 | `ssh_target` | built from `guest_ip` + `ssh_port` | queried from `limactl` (per-boot forwarded port) |
-| workspace/mounts | rsync over SSH | live mounts |
+| copied workspace (`--copy`) | one-time rsync over SSH | one-time rsync over SSH |
+| project and extra mounts | one-time rsync over SSH | live virtiofs mounts |
 
 ### Typestate invariants
 

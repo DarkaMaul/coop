@@ -1101,7 +1101,6 @@ fn provision_first_boot(
 
     signal::check_shutdown()?;
 
-    // Workspace sync: rsync for --workspace, git clone for --git-repo.
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.

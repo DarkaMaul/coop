@@ -4642,7 +4642,6 @@ test_appledouble_sidecars() {
         return
     fi
 
-    # Check both the initial copy and the return transfer.
     GUEST_INSTANCE="$ad_instance"
     if sidecars=$(coop_exec sh -c 'find /workspace -name "._*"'); then
         if [[ -z "$sidecars" ]]; then

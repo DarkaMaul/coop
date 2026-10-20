@@ -32,6 +32,9 @@ rsync in its guest images. If it has been removed from a guest, install it
 again before copying, pushing, pulling, or syncing Firecracker mounts; coop
 does not fall back to another transfer tool.
 
+Workspace transfers do not preserve hard-link relationships. Source paths that
+share an inode are copied as independent files.
+
 `coop up --mount` mounts the project directory into the guest. Behavior differs
 by backend:
 
@@ -104,8 +107,9 @@ Before overwriting guest files, `push` checks for in-guest work the host doesn't
 If either signal finds anything, push prints it and exits. `--force` overrides both.
 
 Push uses rsync with `--delete` to mirror the host directory, subject to the
-exclusions below. Excluded destination entries are preserved. Lima mounts
-normally expose host changes directly in the guest.
+exclusions below. Entries protected by the default exclusions are preserved;
+entries ignored only through per-directory `.gitignore` rules may be deleted.
+Lima mounts normally expose host changes directly in the guest.
 
 ## Pulling: guest to host
 
